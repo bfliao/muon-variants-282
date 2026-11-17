@@ -76,6 +76,31 @@ def _manifold_update(
     if should_transpose:
         W = W.mT
         G = G.mT
+    ascent = _dual_ascent_vectorized if _VECTORIZED_DUAL_ASCENT else _dual_ascent_loop
+    A, _Lambda, steps_taken, residuals, msign_calls = ascent(
+        W, G, dual_cap, tol, dual_lr, msign_steps, msign_dtype)
+    # Descend on the primal problem, then retract to the manifold.
+    new_W = W - lr * A
+    new_W = msign(new_W, steps=msign_steps, dtype=msign_dtype)
+    msign_calls += 1
+    if should_transpose:
+        new_W = new_W.mT
+    return new_W, steps_taken, residuals, msign_calls
+
+
+# Internal switch (NOT a config field, not hashed): True = the vectorized dual
+# ascent (speed-only change, Gate 3); False = the original per-matrix Python
+# loop, kept as the test oracle. Both give the same A, Lambda, per-matrix
+# dual-step counts, residuals and msign call counts.
+_VECTORIZED_DUAL_ASCENT = True
+
+
+@torch.no_grad()
+def _dual_ascent_loop(W, G, dual_cap, tol, dual_lr, msign_steps, msign_dtype):
+    """Original dual ascent on tall stacks W, G (k, m, n): per-matrix Python
+    bookkeeping with one ``.item()`` sync per matrix per iteration.
+    Returns (A, Lambda, steps_taken, residuals, msign_calls) — msign_calls
+    excludes the retraction."""
     k = W.size(0)
     # Initialize the dual variable.
     Lambda = -0.25 * (W.mT @ G + G.mT @ W)
@@ -108,13 +133,44 @@ def _manifold_update(
     if A is None:  # dual_cap == 0: no ascent, use the raw direction
         A = msign(G, steps=msign_steps, dtype=msign_dtype)
         msign_calls += 1
-    # Descend on the primal problem, then retract to the manifold.
-    new_W = W - lr * A
-    new_W = msign(new_W, steps=msign_steps, dtype=msign_dtype)
-    msign_calls += 1
-    if should_transpose:
-        new_W = new_W.mT
-    return new_W, steps_taken, residuals, msign_calls
+    return A, Lambda, steps_taken, residuals, msign_calls
+
+
+@torch.no_grad()
+def _dual_ascent_vectorized(W, G, dual_cap, tol, dual_lr, msign_steps, msign_dtype):
+    """Same algorithm as _dual_ascent_loop with the per-matrix bookkeeping as
+    masked tensor ops: an ``active`` mask per matrix freezes a converged
+    matrix's residual, Lambda and dual-step count exactly where the loop
+    would. One host sync per iteration (the all-converged check) instead of
+    one per matrix. The msign calls themselves are unchanged: every
+    iteration's batched call covers the whole stack, as before."""
+    k = W.size(0)
+    Lambda = -0.25 * (W.mT @ G + G.mT @ W)
+    denom = math.sqrt(Lambda.size(-1) * Lambda.size(-2))
+    active = torch.ones(k, dtype=torch.bool, device=W.device)
+    steps_t = torch.zeros(k, dtype=torch.int64, device=W.device)
+    residuals_t = torch.full((k,), float("inf"), dtype=Lambda.dtype, device=W.device)
+    A = None
+    msign_calls = 0  # counted at the call sites, never derived from dual_steps
+    for step in range(dual_cap):
+        A = msign(G + 2 * W @ Lambda, steps=msign_steps, dtype=msign_dtype)
+        msign_calls += 1
+        H = W.mT @ A + A.mT @ W
+        res = H.norm(dim=(-2, -1)) / denom  # (k,)
+        # active matrices record this residual; those below tol converge now
+        residuals_t = torch.where(active, res, residuals_t)
+        active = active & ~(res < tol)
+        if not bool(active.any()):  # the one host sync per iteration
+            break
+        scale = dual_lr * (1 - step / dual_cap)
+        # torch.where (not a 0/1 multiply) so frozen Lambdas are untouched
+        # bit-for-bit even if H holds non-finite values.
+        Lambda = torch.where(active[:, None, None], Lambda - scale * H, Lambda)
+        steps_t += active.to(torch.int64)
+    if A is None:  # dual_cap == 0: no ascent, use the raw direction
+        A = msign(G, steps=msign_steps, dtype=msign_dtype)
+        msign_calls += 1
+    return A, Lambda, steps_t.tolist(), residuals_t.tolist(), msign_calls
 
 
 class ManifoldMuon(torch.optim.Optimizer):

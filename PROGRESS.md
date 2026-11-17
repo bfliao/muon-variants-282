@@ -43,3 +43,8 @@
   edge_trial observability, trial_counts test). All 14 known traps verified
   neutralized with file:line evidence.
 - Gate 2 report sent; waiting for go-ahead to Phase 3 (smoke + timing runs).
+
+## 2026-11-17 — Phase 3 launched
+- Gate 2 go-ahead received. Team briefing PDF at docs/team_briefing.pdf; repo pushed to a private GitHub repo (tags gate-1, gate-2).
+- Phase 3 smoke+timing (scripts/phase3.sh) running under caffeinate: all 5 studies, every optimizer, Manifold caps 5 and 10; then tables/compute_estimate.md.
+- Gate-3 prep: profiled Manifold Muon (per-matrix dual-ascent bookkeeping was 81-84% of the MoE optimizer step); vectorized it (DEVIATIONS #9, bit-identical, 76 new tests, review APPROVE; suite 393 passed); re-timed transformers per step (DEVIATIONS #10). MoE timings contaminated by a concurrent Zoom call (fwd+bwd varied 160-1130 ms for identical work): re-time on an idle machine before Gate 3.
