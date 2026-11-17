@@ -75,6 +75,21 @@ _RESULT_CONFIG_FIELDS = (
 #: Stage A/B, lr-grid edge trials).  Pilot, budget-curve, init-ablation,
 #: faithful and smoke runs are not trials.
 TUNING_PHASES: tuple[str, ...] = ("cd", "stage_a", "stage_b", "edge")
+PHASE2_TUNING_PHASES: tuple[str, ...] = ("stage_a", "stage_b", "edge")
+
+
+def _has_cd_rows(df: pd.DataFrame, study: str) -> bool:
+    return bool(((df["study"] == study) & (df["phase"] == "cd")).any())
+
+
+def headline_tuning_phases(df: pd.DataFrame, study: str) -> tuple[str, ...]:
+    """The tuning phases behind the study's headline (selected) configs: the
+    coordinate descent ("cd") wherever the study ran one — mlp128/dense, and
+    mlp256/mlp512 since the Gate-3 MLP protocol change (DEVIATIONS.md #12),
+    which ALSO keep an inherited Phase-II track (stage_a/stage_b/edge) at
+    seed 0 for H4 only — else the Phase-II phases. Headline quantities
+    (basin, divergence rate, figures) never mix the two tracks."""
+    return ("cd",) if _has_cd_rows(df, study) else PHASE2_TUNING_PHASES
 _RESULT_TOP_FIELDS = (
     "hash", "status", "diverged_at_step", "final_val_loss", "final_val_acc",
     "final_test_loss", "final_test_acc", "train_val_gap", "dual_steps_mean",
@@ -408,8 +423,15 @@ def _hyper_norm(v):
     return v
 
 
-def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
+def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str,
+                   track: str = "headline") -> pd.DataFrame:
     """Rows forming the optimizer's learning-rate sweep in a study.
+
+    ``track``: "headline" (default) — the sweep behind the study's selected
+    configs: the cd lr sweep wherever the study has cd rows, else Stage A;
+    "inherited" — the Stage-A grid of the inherited Phase-II track (mlp256 /
+    mlp512 / moe; DEVIATIONS.md #12), for H4's inherited-vs-re-tuned
+    comparison. The two tracks are never mixed.
 
     Phase-II studies tune via the 12-trial recipe, so the lr sweep is the
     Stage-A grid (``phase == "stage_a"``).  Phase-I studies (mlp128, dense)
@@ -439,7 +461,13 @@ def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
     """
     rows = df[(df["study"] == study) & (df["optimizer"] == opt)]
     stage = rows[rows["phase"] == "stage_a"]
+    if track == "inherited":
+        return stage
+    if track != "headline":
+        raise ValueError(f"unknown track {track!r}")
     cd = rows[rows["phase"] == "cd"]
+    if not _has_cd_rows(df, study):
+        return stage
     if not cd.empty:
         if "cd_sweep" in cd.columns and cd["cd_sweep"].notna().any():
             cand = cd[cd["cd_sweep"] == "lr"]
@@ -456,10 +484,24 @@ def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
         else:
             best_key = _key(comp.loc[comp["final_val_loss"].idxmin()])
             cd = cd[cd.apply(lambda r: _key(r) == best_key, axis=1)]
-    return pd.concat([stage, cd]) if not cd.empty else stage
+    return cd
 
 
-def lr_basin_width(study: str, opt: str, df: pd.DataFrame, tol: float) -> float:
+def inherited_best_lr(df: pd.DataFrame, study: str, opt: str) -> float | None:
+    """lr of the min seed-0 final-loss trial of the INHERITED Phase-II track
+    (stage_a/stage_b/edge) — H4's inherited optimum in mlp256/mlp512, to set
+    against the fully re-tuned optimum (``_best_lr``). None if no completed
+    trials."""
+    rows = df[(df["study"] == study) & (df["optimizer"] == opt)
+              & df["phase"].isin(PHASE2_TUNING_PHASES)
+              & (df["status"] == "completed")].dropna(subset=["final_val_loss"])
+    if rows.empty:
+        return None
+    return float(rows.loc[rows["final_val_loss"].idxmin(), "lr"])
+
+
+def lr_basin_width(study: str, opt: str, df: pd.DataFrame, tol: float,
+                   track: str = "headline") -> float:
     """Width, in factors of 2, of the lr-sweep range within ``tol`` of best.
 
     The sweep rows are Stage-A trials, or the Phase-I coordinate-descent
@@ -476,7 +518,7 @@ def lr_basin_width(study: str, opt: str, df: pd.DataFrame, tol: float) -> float:
     widen the basin (it is not a basin).  Returns NaN if no completed sweep
     trials exist; 0.0 if only the best lr itself is within tolerance.
     """
-    rows = _lr_sweep_rows(df, study, opt)
+    rows = _lr_sweep_rows(df, study, opt, track)
     rows = rows[rows["status"] == "completed"].dropna(subset=["final_val_loss", "lr"])
     if rows.empty:
         return float("nan")
@@ -503,15 +545,17 @@ def divergence_rate(study: str, opt: str, df: pd.DataFrame) -> float:
     The +0.5-nats criterion is analysis-time only (design §9 answer 10): it
     never stopped a run.
 
-    "Trials" means tuning trials (``TUNING_PHASES``: cd / stage_a / stage_b /
-    edge) plus the fresh-seed 1x runs — both numerator and denominator.
+    "Trials" means the study's HEADLINE tuning trials
+    (``headline_tuning_phases``: cd, or stage_a / stage_b / edge — never both
+    tracks, DEVIATIONS.md #12) plus the fresh-seed 1x runs — both numerator
+    and denominator.
     Budget-curve runs (branches, constant 2x, half-LR), pilot, init-ablation,
     faithful and smoke runs are excluded entirely: a 0.125x decay branch ends
     ~1 nat above the 2x loss BY DESIGN, and counting it against the +0.5-nats
     criterion would read AdamW's own curve as divergence.
     """
     rows = df[(df["study"] == study) & (df["optimizer"] == opt)
-              & df["phase"].isin(TUNING_PHASES + ("fresh_seed",))]
+              & df["phase"].isin(headline_tuning_phases(df, study) + ("fresh_seed",))]
     if rows.empty:
         return float("nan")
     comp = rows[rows["status"] == "completed"]["final_val_loss"].dropna()
@@ -1103,14 +1147,15 @@ def figure_7(df: pd.DataFrame, outdir: Path | str) -> Path:
     Phase-II studies use their Stage-B trials.  Phase-I studies have no Stage
     B; their panels fall back to the coordinate-descent trials (phase "cd"),
     whose lr and wd sweeps form a cross in the lr x wd plane (cells away from
-    the cross stay blank).  Manifold (no wd) shows its lr-only trials."""
+    the cross stay blank).  Manifold (no wd) shows its lr-only trials.
+    Studies with a cd headline (any cd rows, incl. mlp256/mlp512 since
+    DEVIATIONS.md #12) always show the cd (headline) trials, never their
+    inherited Stage B."""
     sb = df[(df["phase"] == "stage_b") & (df["status"] == "completed")]
     cd = df[(df["phase"] == "cd") & (df["status"] == "completed")]
     per_study: dict[str, pd.DataFrame] = {}
     for s in _studies_present(df):
-        g = sb[sb["study"] == s]
-        if g.empty:
-            g = cd[cd["study"] == s]  # Phase-I fallback
+        g = cd[cd["study"] == s] if _has_cd_rows(df, s) else sb[sb["study"] == s]
         if not g.empty:
             per_study[s] = g
     studies = list(per_study)

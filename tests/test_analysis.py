@@ -699,3 +699,52 @@ def test_inf_speedup_robust_figure_and_table(tmp_path):
     assert p.exists() and p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     t = an.main_table(mini, tmp_path / "tables")
     assert "inf" in t.read_text()
+
+
+# ---------------------------------------------------- two tuning tracks (#12)
+
+def _two_track_df():
+    """mlp256/adamw with BOTH a cd lr sweep (headline, best lr 2e-3) and an
+    inherited stage_a grid (best lr 5e-4), plus fresh seeds on the cd winner."""
+    rows = []
+    def r(phase, lr, loss, status="completed", **kw):
+        rows.append(dict(study="mlp256", optimizer="adamw", phase=phase, lr=lr,
+                         wd=0.1, final_val_loss=loss, status=status,
+                         cd_sweep="lr" if phase == "cd" else None, **kw))
+    for lr, loss in [(1.25e-4, 1.30), (2.5e-4, 1.20), (5e-4, 1.10), (1e-3, 1.05),
+                     (2e-3, 1.00), (4e-3, 1.02)]:
+        r("cd", lr, loss)
+    for lr, loss in [(1.25e-4, 1.25), (2.5e-4, 1.06), (5e-4, 0.90), (1e-3, 0.91),
+                     (2e-3, 3.50), (4e-3, None)]:
+        r("stage_a", lr, loss, status="completed" if loss else "diverged")
+    for s in (1, 2, 3):
+        r("fresh_seed", 2e-3, 1.0, seed=s)
+    return pd.DataFrame(rows)
+
+
+def test_lr_sweep_rows_never_mix_tracks():
+    df2 = _two_track_df()
+    head = an._lr_sweep_rows(df2, "mlp256", "adamw")
+    inh = an._lr_sweep_rows(df2, "mlp256", "adamw", track="inherited")
+    assert set(head["phase"]) == {"cd"} and len(head) == 6
+    assert set(inh["phase"]) == {"stage_a"} and len(inh) == 6
+    with pytest.raises(ValueError):
+        an._lr_sweep_rows(df2, "mlp256", "adamw", track="both")
+
+
+def test_basin_and_optima_per_track():
+    df2 = _two_track_df()
+    # headline cd: best 1.00 at 2e-3; within 1%: 2e-3 only (4e-3 is 1.02)
+    assert an.lr_basin_width("mlp256", "adamw", df2, 0.01) == 0.0
+    # inherited: best 0.90 at 5e-4; 1e-3 (0.91, +1.1%) is within the 2% tol -> width 1
+    assert an.lr_basin_width("mlp256", "adamw", df2, 0.02, track="inherited") == 1.0
+    assert an.inherited_best_lr(df2, "mlp256", "adamw") == pytest.approx(5e-4)
+    assert an._best_lr(df2, "mlp256", "adamw") == pytest.approx(2e-3)
+
+
+def test_divergence_rate_uses_headline_track_only():
+    df2 = _two_track_df()
+    # headline: 6 cd + 3 fresh, none diverged or > best + 0.5 -> 0
+    assert an.divergence_rate("mlp256", "adamw", df2) == 0.0
+    assert an.headline_tuning_phases(df2, "mlp256") == ("cd",)
+    assert an.headline_tuning_phases(df2, "moe") == ("stage_a", "stage_b", "edge")

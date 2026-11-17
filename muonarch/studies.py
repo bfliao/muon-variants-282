@@ -9,6 +9,12 @@ Implements design.md §3.10, §5 and §6, adapted to the final module reality:
   Both shapes then share: fresh seeds -> AdamW budget curve -> Muon init
   ablation -> faithful-settings reruns.
 
+* MLP protocol change (Gate 3, DEVIATIONS.md #12): FULL_RETUNE_STUDIES
+  (mlp256, mlp512) run BOTH tracks — the full Phase-I coordinate descent
+  (headline: fresh seeds and the shared tail use its winner) and the
+  inherited Phase-II recipe at seed 0 (for H4). Each track's muon/manifold
+  auxiliary AdamW group comes from AdamW's winner on the same track.
+
 * Configs are generated LAZILY: a ``Phase``'s ``configs()`` closure reads the
   ``ResultsView`` it was built with, so later phases' configs depend on
   earlier results (cd acceptance, Stage-B best lrs, edge extensions, half-LR
@@ -126,8 +132,18 @@ OPTIMIZERS: tuple[str, ...] = ("adamw", "muon", "moonlight", "manifold", "muonal
 
 PHASE1_STUDIES: tuple[str, ...] = ("mlp128", "dense")
 PHASE2_DONOR: dict[str, str] = {"mlp256": "mlp128", "mlp512": "mlp128", "moe": "dense"}
-#: Studies that run the 3-seed AdamW pilot (PLAN "Seed-spread pilot").
-PILOT_STUDIES: tuple[str, ...] = ("mlp128", "mlp512", "dense")
+#: MLP protocol change (Paul, Gate 3; DEVIATIONS.md #12): these Phase-II
+#: studies ALSO run the full Phase-I coordinate descent independently (same
+#: CD_ORDER, grids, pass limit and acceptance rule as mlp128, starting from
+#: literature defaults, acceptance threshold from their own pilot). The
+#: re-tuned CD winner is the HEADLINE (fresh seeds, budget curve, init
+#: ablation, faithful reruns, main table); the inherited Phase-II track is
+#: kept at seed 0 only, for H4 (optimal lr inherited vs fully re-tuned).
+#: dense/moe are unchanged.
+FULL_RETUNE_STUDIES: tuple[str, ...] = ("mlp256", "mlp512")
+#: Studies that run the 3-seed AdamW pilot (PLAN "Seed-spread pilot");
+#: mlp256 added with the full re-tune (it needs its own acceptance threshold).
+PILOT_STUDIES: tuple[str, ...] = ("mlp128", "mlp256", "mlp512", "dense")
 PILOT_SEEDS: tuple[int, ...] = (101, 102, 103)  # Gate-0 answer 6
 
 #: Phase-I coordinate-descent sweep order. NO warmup — fixed at 5% of the 1x
@@ -341,7 +357,8 @@ def run_config(sv: dict, opt: str, phase: str, values: dict, *, seed: int = 0,
 # pilot
 
 def pilot_configs(study: str, config_dir=None) -> list[dict]:
-    """AdamW default config, seeds 101-103; mlp128, mlp512 and dense only."""
+    """AdamW default config, seeds 101-103; PILOT_STUDIES only (mlp128, mlp256
+    — added with the full re-tune, DEVIATIONS.md #12 — mlp512, dense)."""
     if study not in PILOT_STUDIES:
         return []
     sv = load_study(study, config_dir)
@@ -495,15 +512,26 @@ def _cd_spec(opt: str) -> list[tuple[int, str]]:
     return [(p, hp) for p in (1, 2) for hp in cd_hypers(opt)]
 
 
+def _has_cd(study: str) -> bool:
+    """Studies that run the Phase-I coordinate descent (and select on it)."""
+    return study in PHASE1_STUDIES or study in FULL_RETUNE_STUDIES
+
+
 def _adamw_group_for(study: str, opt: str, view: ResultsView,
-                     config_dir=None) -> tuple[float, float] | None:
+                     config_dir=None, track: str = "auto") -> tuple[float, float] | None:
     """(lr, wd) the muon/manifold auxiliary AdamW group must use — AdamW's
-    tuned winner for this study (Phase I: cd state; Phase II: Stage winner).
-    None while AdamW's tuning is incomplete. For other optimizers: None (and
-    unused)."""
+    tuned winner for this study ON THE SAME TRACK (Phase I: cd state; Phase
+    II: Stage winner). ``track``: "cd", "phase2", or "auto" (= cd in
+    Phase-I studies, phase2 otherwise). In FULL_RETUNE_STUDIES the CD track
+    uses AdamW's CD values and the inherited Phase-II track keeps using
+    AdamW's Phase-II winner, so each track is internally consistent. None
+    while AdamW's tuning on that track is incomplete. For other optimizers:
+    None (and unused)."""
     if opt not in ("muon", "manifold"):
         return None
-    if study in PHASE1_STUDIES:
+    if track == "auto":
+        track = "cd" if study in PHASE1_STUDIES else "phase2"
+    if track == "cd":
         vals = phase1_values(study, "adamw", view, config_dir)
         return None if vals is None else (vals["lr"], vals["wd"])
     best = _phase2_best_trial(study, "adamw", view, config_dir)
@@ -523,7 +551,7 @@ def cd_replay(study: str, opt: str, view: ResultsView,
     state = cd_defaults(sv, opt)
 
     std = pilot_seed_std(study, view, config_dir)
-    group = _adamw_group_for(study, opt, view, config_dir)
+    group = _adamw_group_for(study, opt, view, config_dir, track="cd")
     if std is None or (opt in ("muon", "manifold") and group is None):
         return CDReplay(blocked=True, state=state, sweeps=sweeps, done=False)
 
@@ -614,7 +642,7 @@ def _stage_cells(study: str, opt: str, view: ResultsView, config_dir=None):
     muon/manifold, incomplete)."""
     sv = load_study(study, config_dir)
     vals = inherited_values(study, opt, view, config_dir)
-    group = _adamw_group_for(study, opt, view, config_dir)
+    group = _adamw_group_for(study, opt, view, config_dir, track="phase2")
     if vals is None or (opt in ("muon", "manifold") and group is None):
         return None
     centre = float(sv["optimizers"][opt]["lr"])
@@ -720,15 +748,16 @@ def _phase2_best_trial(study: str, opt: str, view: ResultsView,
 def best_config(study: str, opt: str, view: ResultsView,
                 config_dir=None) -> dict | None:
     """The optimizer's winning seed-0 config for this study, or None while
-    tuning is incomplete. Phase-I studies: the coordinate-descent accepted
-    state, directly; Phase-II studies: the min-loss tuning trial (design §6).
+    tuning is incomplete. Phase-I studies AND FULL_RETUNE_STUDIES: the
+    coordinate-descent accepted state, directly (the re-tuned headline);
+    other Phase-II studies: the min-loss tuning trial (design §6).
     """
     sv = load_study(study, config_dir)
-    if study in PHASE1_STUDIES:
+    if _has_cd(study):
         vals = phase1_values(study, opt, view, config_dir)
         if vals is None:
             return None
-        group = _adamw_group_for(study, opt, view, config_dir)
+        group = _adamw_group_for(study, opt, view, config_dir, track="cd")
         return run_config(sv, opt, "cd", vals, seed=0, adamw_group=group)
     return _phase2_best_trial(study, opt, view, config_dir)
 
@@ -863,8 +892,17 @@ def _cd_phase_names(opt: str) -> list[str]:
 
 
 def _build_dag_phase1(study: str, view: ResultsView, config_dir=None) -> list[Phase]:
-    sv = load_study(study, config_dir)
     phases = [Phase("pilot", (), lambda: pilot_configs(study, config_dir))]
+    phases += _cd_phases(study, view, config_dir)
+    phases += _shared_phases(study, view, config_dir)
+    return phases
+
+
+def _cd_phases(study: str, view: ResultsView, config_dir=None) -> list[Phase]:
+    """Per optimizer: the coordinate-descent sweep phases (+ lr edge phases)
+    then ``{opt}_fresh`` on the CD winner. Needs the study's "pilot" phase."""
+    sv = load_study(study, config_dir)
+    phases = []
     adamw_end = _cd_phase_names("adamw")[-1]
     for opt in _included(sv):
         first_needs = ("pilot",) if opt not in ("muon", "manifold") \
@@ -890,14 +928,27 @@ def _build_dag_phase1(study: str, view: ResultsView, config_dir=None) -> list[Ph
         phases.append(Phase(
             f"{opt}_fresh", (prev,),
             lambda o=opt: fresh_seed_configs(study, o, view, config_dir)))
+    return phases
+
+
+def _build_dag_full_retune(study: str, view: ResultsView, config_dir=None) -> list[Phase]:
+    """FULL_RETUNE_STUDIES: pilot -> CD track (headline, ends in fresh seeds)
+    and, in parallel, the inherited Phase-II track (seed 0 only, no fresh
+    seeds) -> shared tail on the CD winners."""
+    phases = [Phase("pilot", (), lambda: pilot_configs(study, config_dir))]
+    phases += _cd_phases(study, view, config_dir)
+    phases += _build_dag_phase2(study, view, config_dir, tail=False)
     phases += _shared_phases(study, view, config_dir)
     return phases
 
 
-def _build_dag_phase2(study: str, view: ResultsView, config_dir=None) -> list[Phase]:
+def _build_dag_phase2(study: str, view: ResultsView, config_dir=None,
+                      tail: bool = True) -> list[Phase]:
+    """``tail=False`` (FULL_RETUNE_STUDIES): only the tuning phases — no
+    pilot (the caller adds it), no fresh seeds, no shared tail."""
     sv = load_study(study, config_dir)
     phases = []
-    if study in PILOT_STUDIES:
+    if tail and study in PILOT_STUDIES:
         phases.append(Phase("pilot", (), lambda: pilot_configs(study, config_dir)))
 
     def donor_ready(o):
@@ -926,10 +977,13 @@ def _build_dag_phase2(study: str, view: ResultsView, config_dir=None) -> list[Ph
             Phase(f"{opt}_edge", (f"{opt}_stage_a",), e_cfgs),
             Phase(f"{opt}_stage_b", (f"{opt}_edge",), b_cfgs),
             Phase(f"{opt}_edge_b", (f"{opt}_stage_b",), eb_cfgs),
-            Phase(f"{opt}_fresh", (f"{opt}_edge_b",),
-                  lambda o=opt: fresh_seed_configs(study, o, view, config_dir)),
         ]
-    phases += _shared_phases(study, view, config_dir)
+        if tail:
+            phases.append(Phase(
+                f"{opt}_fresh", (f"{opt}_edge_b",),
+                lambda o=opt: fresh_seed_configs(study, o, view, config_dir)))
+    if tail:
+        phases += _shared_phases(study, view, config_dir)
     return phases
 
 
@@ -968,6 +1022,8 @@ def build_dag(study: str, view: ResultsView, config_dir=None) -> list[Phase]:
     shapes). Rebuilt from the results view every runner pass."""
     if study in PHASE1_STUDIES:
         return _build_dag_phase1(study, view, config_dir)
+    if study in FULL_RETUNE_STUDIES:
+        return _build_dag_full_retune(study, view, config_dir)
     if study in PHASE2_DONOR:
         return _build_dag_phase2(study, view, config_dir)
     raise ValueError(f"unknown study {study!r}")
@@ -999,7 +1055,7 @@ def planned_jobs(study: str, config_dir=None) -> list[dict]:
     for opt in _included(sv):
         g = group.get(opt)
         vals = cd_defaults(sv, opt)
-        if study in PHASE1_STUDIES:
+        if _has_cd(study):
             for hp in cd_hypers(opt):
                 key = _state_key(hp, opt)
                 for v in _grid_values(hp, opt, vals, sv):
@@ -1007,7 +1063,7 @@ def planned_jobs(study: str, config_dir=None) -> list[dict]:
                     vv[key] = v
                     add(run_config(sv, opt, "cd", vv, seed=0, adamw_group=g,
                                    cd_sweep=_sweep_label(hp, opt)))
-        else:
+        if study not in PHASE1_STUDIES:
             lrs = stage_a_grid(study, opt, config_dir)
             for lr in lrs:
                 add(run_config(sv, opt, "stage_a", dict(vals, lr=lr),
@@ -1054,10 +1110,21 @@ def planned_jobs(study: str, config_dir=None) -> list[dict]:
     return list(jobs.values())
 
 
-def trial_counts(view: ResultsView, study: str, config_dir=None) -> dict[str, int]:
-    """Completed tuning trials per optimizer (phases cd/stage_a/stage_b/edge),
-    for the report (PLAN Phase II: 'Report the number of trials each
-    optimizer used')."""
+def trial_counts(view: ResultsView, study: str, config_dir=None,
+                 track: str = "headline") -> dict[str, int]:
+    """Completed tuning trials per optimizer, for the report (PLAN Phase II:
+    'Report the number of trials each optimizer used'). ``track``:
+    "headline" — the trials behind the selected configs (phase cd in studies
+    with coordinate descent, else stage_a/stage_b/edge); "inherited" — the
+    inherited Phase-II track (stage_a/stage_b/edge) of mlp256/mlp512/moe.
+    The two tracks of a FULL_RETUNE study are never summed (DEVIATIONS.md
+    #12)."""
+    if track == "headline":
+        phases = ("cd",) if _has_cd(study) else ("stage_a", "stage_b", "edge")
+    elif track == "inherited":
+        phases = ("stage_a", "stage_b", "edge")
+    else:
+        raise ValueError(f"unknown track {track!r}")
     counts = dict.fromkeys(OPTIMIZERS, 0)
     results_dir = Path(view.root) / "results" / study
     if not results_dir.is_dir():
@@ -1068,7 +1135,7 @@ def trial_counts(view: ResultsView, study: str, config_dir=None) -> dict[str, in
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
         cfg = res.get("config", {})
-        if cfg.get("phase") in ("cd", "stage_a", "stage_b", "edge"):
+        if cfg.get("phase") in phases:
             opt = cfg.get("optimizer")
             if opt in counts:
                 counts[opt] += 1

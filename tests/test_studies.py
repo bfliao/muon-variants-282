@@ -116,12 +116,12 @@ def test_load_study_constants():
 # ---------------------------------------------------------------- pilot
 
 def test_pilot_configs_seeds_and_studies():
-    for study in ("mlp128", "mlp512", "dense"):
+    # mlp256 gained a pilot with the full re-tune (DEVIATIONS.md #12)
+    for study in ("mlp128", "mlp256", "mlp512", "dense"):
         cfgs = studies.pilot_configs(study)
         assert [c["seed"] for c in cfgs] == [101, 102, 103]
         assert all(c["phase"] == "pilot" and c["optimizer"] == "adamw"
                    for c in cfgs)
-    assert studies.pilot_configs("mlp256") == []
     assert studies.pilot_configs("moe") == []
 
 
@@ -485,13 +485,15 @@ def test_phase2_selection_min_seed0_loss(tmp_path):
         plant(tmp_path, c,
               0.4 if (math.isclose(c["lr"], 5e-4)
                       and math.isclose(c["wd"], 0.3 * d_wd)) else 0.95)
-    best = studies.best_config("mlp256", "adamw", view_of(tmp_path))
+    # mlp256 is a FULL_RETUNE study (DEVIATIONS.md #12): its inherited
+    # Phase-II track still selects the min seed-0 loss trial ...
+    best = studies._phase2_best_trial("mlp256", "adamw", view_of(tmp_path))
     assert best["lr"] == pytest.approx(5e-4)
     assert best["wd"] == pytest.approx(0.3 * d_wd)
-    fresh = studies.fresh_seed_configs("mlp256", "adamw", view_of(tmp_path))
-    assert [c["seed"] for c in fresh] == [1, 2, 3]
-    assert all(c["phase"] == "fresh_seed"
-               and c["lr"] == pytest.approx(5e-4) for c in fresh)
+    # ... but the headline (best_config / fresh seeds) is the CD track, which
+    # has not run here (no mlp256 pilot): nothing is selected yet
+    assert studies.best_config("mlp256", "adamw", view_of(tmp_path)) is None
+    assert studies.fresh_seed_configs("mlp256", "adamw", view_of(tmp_path)) == []
 
 
 # ---------------------------------------------------------------- fresh seeds
@@ -611,9 +613,11 @@ def test_planned_job_counts_no_edge_scenario():
     """Gate-report numbers: the planning enumeration under the documented
     no-change/no-edge scenario (matches the fake end-to-end run)."""
     counts = {s: len(studies.planned_jobs(s)) for s in studies.STUDIES}
-    assert counts == {"mlp128": 101, "mlp256": 94, "mlp512": 97,
+    # mlp256/mlp512 run both tracks (DEVIATIONS.md #12): +64 cd jobs each,
+    # +3 pilot runs at mlp256
+    assert counts == {"mlp128": 101, "mlp256": 161, "mlp512": 161,
                       "dense": 101, "moe": 94}
-    assert sum(counts.values()) == 487
+    assert sum(counts.values()) == 618
 
 
 # ---------------------------------------------------------------- exclusion
@@ -643,7 +647,10 @@ def test_exclude_optimizers_drops_only_that_chain(tmp_path, moe_without_manifold
     assert names.isdisjoint(with_m)
     # everything else is still there: vs an unexcluded same-shape study, the
     # difference is EXACTLY the manifold chain
-    other = {p.name for p in studies.build_dag("mlp256", view_of(tmp_path))}
+    # (mlp256 also has the pilot and the CD track since DEVIATIONS.md #12;
+    # compare against its Phase-II-shaped part)
+    other = {p.name for p in studies.build_dag("mlp256", view_of(tmp_path))
+             if "_cd_" not in p.name and p.name != "pilot"}
     assert other - names == with_m
     assert names <= other
     # planned enumeration honors the exclusion: 94 - 16 manifold jobs
@@ -736,3 +743,125 @@ def test_trial_counts(tmp_path):
                       "manifold": 0, "muonall": 1}
     assert studies.trial_counts(view_of(tmp_path), "dense") == dict.fromkeys(
         studies.OPTIMIZERS, 0)
+
+
+# ---------------------------------------------------------------- full re-tune
+# MLP protocol change (Gate 3, DEVIATIONS.md #12): mlp256/mlp512 run the full
+# Phase-I coordinate descent (headline) AND the inherited Phase-II track (H4).
+
+def test_full_retune_constants_and_unchanged_studies():
+    assert studies.FULL_RETUNE_STUDIES == ("mlp256", "mlp512")
+    assert studies.PHASE1_STUDIES == ("mlp128", "dense")      # unchanged
+    assert "moe" not in studies.FULL_RETUNE_STUDIES           # dense/moe unchanged
+
+
+@pytest.mark.parametrize("study", ["mlp256", "mlp512"])
+def test_full_retune_dag_has_both_tracks(study, tmp_path):
+    dag = _dag_by_name(study, tmp_path)
+    # CD track: same shape as mlp128's, gated on this study's pilot
+    assert dag["adamw_cd_p1_lr"].needs == ("pilot",)
+    assert set(dag["muon_cd_p1_lr"].needs) == {"pilot", "adamw_cd_p2_clip"}
+    assert set(dag["manifold_cd_p1_lr"].needs) == {"pilot", "adamw_cd_p2_clip"}
+    # inherited Phase-II track, unchanged gating, no fresh seeds of its own
+    assert dag["muon_stage_a"].needs == ("adamw_edge_b",)
+    assert dag["adamw_stage_a"].needs == ()
+    # fresh seeds (and so the whole shared tail) hang off the CD track
+    for opt in studies.OPTIMIZERS:
+        assert dag[f"{opt}_fresh"].needs == (f"{opt}_cd_p2_clip",)
+    assert dag["budget_constant"].needs == ("adamw_fresh",)
+    assert len([n for n in dag if n.endswith("_fresh")]) == 5
+
+
+def test_full_retune_cd_uses_own_pilot_and_tracks_keep_own_adamw_group(tmp_path):
+    d = 1e-3
+    finish_phase1(tmp_path, "mlp128")               # Phase-II donor
+    # without mlp256's own pilot the CD track is blocked (own threshold)
+    assert studies.cd_replay("mlp256", "adamw", view_of(tmp_path)).blocked
+    plant_pilot(tmp_path, "mlp256", (1.0, 1.01, 1.02))
+    # CD track: 2x the default lr wins decisively
+    complete_cd(tmp_path, "mlp256", "adamw",
+                lambda c: 0.5 if math.isclose(c["lr"], 2 * d) else 1.0)
+    # inherited track: 0.5x the default lr wins Stage A and B
+    _finish_stage_a(tmp_path, "mlp256", "adamw",
+                    lambda c: 0.6 if math.isclose(c["lr"], 0.5 * d) else 1.0)
+    for _, c in studies._stage_b_cells("mlp256", "adamw", view_of(tmp_path))[0]:
+        plant(tmp_path, c, 0.7)
+    v = view_of(tmp_path)
+    assert studies._phase2_best_trial("mlp256", "adamw", v)["lr"] == pytest.approx(0.5 * d)
+    # headline = CD winner
+    best = studies.best_config("mlp256", "adamw", v)
+    assert best["lr"] == pytest.approx(2 * d) and best["phase"] == "cd"
+    fresh = studies.fresh_seed_configs("mlp256", "adamw", v)
+    assert [c["seed"] for c in fresh] == [1, 2, 3]
+    assert all(c["lr"] == pytest.approx(2 * d) for c in fresh)
+    # each track's muon runs use AdamW's winner on THAT track
+    rep = studies.cd_replay("mlp256", "muon", v)
+    assert not rep.blocked
+    assert all(c["adamw_group_lr"] == pytest.approx(2 * d)
+               for c in rep.sweeps["p1_lr"].configs)
+    st = studies._stage_cells("mlp256", "muon", v)
+    assert st is not None
+    assert all(c["adamw_group_lr"] == pytest.approx(0.5 * d) for _, c in st[0])
+
+
+def test_full_retune_cd_matches_mlp128_protocol(tmp_path):
+    """Same CD order, grids (relative to the defaults), phase label and
+    cd_sweep labels as mlp128; only the study (width) differs."""
+    for st in ("mlp128", "mlp256"):
+        plant_pilot(tmp_path, st)
+    a = studies.cd_replay("mlp128", "muonall", view_of(tmp_path)).sweeps["p1_lr"].configs
+    b = studies.cd_replay("mlp256", "muonall", view_of(tmp_path)).sweeps["p1_lr"].configs
+    strip = lambda c: {k: v for k, v in c.items() if k not in ("study", "arch", "width")}
+    assert [strip(c) for c in a] == [strip(c) for c in b]
+
+
+def test_full_retune_all_cd_sweeps_match_mlp128(tmp_path):
+    """Every CD sweep (lr, wd, momentum/beta1, beta2, clip; both passes; all
+    optimizers) generates the same cells at mlp256 as at mlp128, up to the
+    study/width fields."""
+    def cells(study):
+        root = tmp_path / study
+        plant_pilot(root, study)
+        for opt in studies.OPTIMIZERS:
+            # adamw's 2x-lr cell wins pass 1 so a second pass runs too
+            complete_cd(root, study, opt,
+                        lambda c: 0.5 if (c["optimizer"] == "adamw" and
+                                          math.isclose(c["lr"], 2e-3)) else 1.0)
+        out = set()
+        for p in (root / "results" / study).glob("*.json"):
+            c = json.loads(p.read_text())["config"]
+            if c["phase"] == "cd":
+                out.add(json.dumps({k: v for k, v in c.items()
+                                    if k not in ("study", "arch", "width")},
+                                   sort_keys=True))
+        return out
+    a, b = cells("mlp128"), cells("mlp256")
+    assert a == b and len(a) > 64     # pass 2 ran for adamw
+
+
+def test_full_retune_threshold_is_own_pilot_std(tmp_path):
+    """Acceptance uses mlp256's OWN pilot std: an improvement of 0.05 is
+    accepted where the pilot std is 0.01 (threshold 0.02) and rejected where
+    it is 0.05 (threshold 0.10)."""
+    d = 1e-3
+    win = lambda c: 0.95 if math.isclose(c["lr"], 2 * d) else 1.0
+    plant_pilot(tmp_path, "mlp128", (1.0, 1.01, 1.02))     # std 0.01
+    plant_pilot(tmp_path, "mlp256", (1.0, 1.05, 1.10))     # std 0.05
+    assert complete_cd(tmp_path, "mlp128", "adamw", win).state["lr"] == pytest.approx(2 * d)
+    assert complete_cd(tmp_path, "mlp256", "adamw", win).state["lr"] == pytest.approx(d)
+
+
+def test_trial_counts_tracks_never_summed(tmp_path):
+    finish_phase1(tmp_path, "mlp128")
+    plant_pilot(tmp_path, "mlp256")
+    complete_cd(tmp_path, "mlp256", "adamw")
+    _finish_stage_a(tmp_path, "mlp256", "adamw")
+    v = view_of(tmp_path)
+    n_cd = len([p for p in (tmp_path / "results" / "mlp256").glob("*.json")
+                if json.loads(p.read_text())["config"]["phase"] == "cd"])
+    head = studies.trial_counts(v, "mlp256")
+    inh = studies.trial_counts(v, "mlp256", track="inherited")
+    assert head["adamw"] == n_cd
+    assert inh["adamw"] == 6          # Stage A only so far
+    with pytest.raises(ValueError):
+        studies.trial_counts(v, "mlp256", track="both")
