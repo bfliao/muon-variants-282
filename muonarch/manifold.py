@@ -15,7 +15,10 @@ Algorithm per the vendored third_party/manifolds/src/manifold_muon.py
   batched msign call (dual ascent included), with per-matrix early-stop
   tracking: once a matrix's residual ||H||/sqrt(numel(H)) < tol its Lambda is
   frozen; the loop stops when all matrices are converged or the cap is hit;
-- step() returns per-matrix dual-ascent statistics for logging;
+- step() returns per-matrix dual-ascent statistics for logging, including
+  "msign_calls": the msign invocations actually made, counted at the call
+  sites (Gate-1 decision) — ascent calls incl. the early-stop check call,
+  plus the retraction — for FLOP accounting;
 - no weight decay anywhere.
 
 Self-contained: no imports from third_party/ (the shared Nesterov code path
@@ -55,9 +58,18 @@ def _manifold_update(
     dual_lr: float,
     msign_steps: int,
     msign_dtype: torch.dtype,
-) -> tuple[torch.Tensor, list[int], list[float]]:
+) -> tuple[torch.Tensor, list[int], list[float], int]:
     """One batched Manifold Muon update for stacked matrices W, G of shape
-    (k, m, n). Returns (new_W, dual_steps_per_matrix, final_residual_per_matrix).
+    (k, m, n). Returns (new_W, dual_steps_per_matrix,
+    final_residual_per_matrix, msign_calls).
+
+    ``msign_calls`` counts the msign invocations actually made at the call
+    sites (Gate-1 decision; never derived from dual_steps): one per
+    dual-ascent loop iteration entered — including the final call when early
+    stop fires — plus the cap==0 fallback call if taken, plus the retraction
+    call. Each batched call covers every matrix in the stack (converged
+    matrices only have their Lambda frozen; they are still in the msign
+    input), so the count applies to each matrix in the group.
     """
     # Ensure the matrices are tall, as in the reference.
     should_transpose = W.size(-2) < W.size(-1)
@@ -72,9 +84,11 @@ def _manifold_update(
     steps_taken = [0] * k
     residuals = [float("inf")] * k
     A = None
+    msign_calls = 0  # counted at the call sites, never derived from dual_steps
     # Ascend on the dual problem to find the update direction A.
     for step in range(dual_cap):
         A = msign(G + 2 * W @ Lambda, steps=msign_steps, dtype=msign_dtype)
+        msign_calls += 1
         # Deviation of A from the tangent space, per matrix.
         H = W.mT @ A + A.mT @ W
         res = H.norm(dim=(-2, -1)) / denom  # (k,)
@@ -93,12 +107,14 @@ def _manifold_update(
                 steps_taken[i] += 1
     if A is None:  # dual_cap == 0: no ascent, use the raw direction
         A = msign(G, steps=msign_steps, dtype=msign_dtype)
+        msign_calls += 1
     # Descend on the primal problem, then retract to the manifold.
     new_W = W - lr * A
     new_W = msign(new_W, steps=msign_steps, dtype=msign_dtype)
+    msign_calls += 1
     if should_transpose:
         new_W = new_W.mT
-    return new_W, steps_taken, residuals
+    return new_W, steps_taken, residuals, msign_calls
 
 
 class ManifoldMuon(torch.optim.Optimizer):
@@ -139,13 +155,18 @@ class ManifoldMuon(torch.optim.Optimizer):
     def step(self, closure=None) -> dict:
         """One optimization step.
 
-        Returns {"dual_steps": [...], "dual_residual": [...]}: per matrix, the
-        number of dual-ascent updates actually applied to its Lambda and the
-        final residual ||H||/sqrt(numel(H)). Order: shape groups in first-seen
-        order, matrices within a group in encounter order (grouped_by_shape may
-        reorder when shapes interleave; no index->parameter map is exposed).
-        Ascent msign calls per group = max(steps)+1 when early stop fired,
-        = cap otherwise (relevant to FLOP accounting).
+        Returns {"dual_steps": [...], "dual_residual": [...],
+        "msign_calls": [...]}: per matrix, the number of dual-ascent updates
+        actually applied to its Lambda, the final residual
+        ||H||/sqrt(numel(H)), and the number of msign invocations actually
+        made for its shape group this step — counted at the call sites
+        (Gate-1 decision), never derived from dual_steps: every ascent-loop
+        iteration's call (including the final call when early stop fires,
+        and the cap==0 fallback) plus the retraction call. Batched calls
+        cover every matrix in the group, so matrices in one group share the
+        same count. Order: shape groups in first-seen order, matrices within
+        a group in encounter order (grouped_by_shape may reorder when shapes
+        interleave; no index->parameter map is exposed).
         """
         loss = None
         if closure is not None:
@@ -154,6 +175,7 @@ class ManifoldMuon(torch.optim.Optimizer):
 
         dual_steps: list[int] = []
         dual_residual: list[float] = []
+        msign_calls: list[int] = []
         for group in self.param_groups:
             momentum = group["momentum"]
             with_grad = [p for p in group["params"] if p.grad is not None]
@@ -173,7 +195,7 @@ class ManifoldMuon(torch.optim.Optimizer):
                     updates.append(p.grad + momentum * buf)
                 W = torch.stack([p.detach().float() for p in plist])
                 G = torch.stack([u.float() for u in updates])
-                new_W, steps_taken, residuals = _manifold_update(
+                new_W, steps_taken, residuals, group_calls = _manifold_update(
                     W,
                     G,
                     lr=group["lr"],
@@ -187,8 +209,13 @@ class ManifoldMuon(torch.optim.Optimizer):
                     p.copy_(w)
                 dual_steps.extend(steps_taken)
                 dual_residual.extend(residuals)
+                msign_calls.extend([group_calls] * len(plist))
 
-        result = {"dual_steps": dual_steps, "dual_residual": dual_residual}
+        result = {
+            "dual_steps": dual_steps,
+            "dual_residual": dual_residual,
+            "msign_calls": msign_calls,
+        }
         if loss is not None:
             result["loss"] = loss
         return result

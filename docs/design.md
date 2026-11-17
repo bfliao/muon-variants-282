@@ -246,7 +246,8 @@ class FineWeb:
 def lm_batches(fw: FineWeb, seed: int, steps: int, batch_seqs: int = 32,
                seq_len: int = 256) -> Iterator[tuple[Tensor, Tensor]]
     # Non-overlapping 257-token windows (256 predictions each): sequence i covers tokens
-    # [i*seq_len, i*seq_len + seq_len + 1) (x = first 256, y = shifted) — Gate-0 answer 7.
+    # [i*(seq_len+1), (i+1)*(seq_len+1)) i.e. stride 257, truly non-overlapping
+    # (x = first 256, y = shifted) — Gate-0 answer 7; pool fixed at 156,224 windows.
     # The window order is a permutation of ALL windows needed for the 2x budget, drawn
     # once from seed; every run takes a prefix.
     # => prefix consistency: the 1x run's data order is exactly the first half of the
@@ -300,8 +301,10 @@ CHECKPOINT_FRACTIONS: tuple[float, ...] = (0.125, 0.25, 0.5)
 
 def warmup_steps(base_steps_1x: int, frac: float = 0.05) -> int
     # round(frac * base_steps_1x), absolute steps, identical for every branch; frac is
-    # cfg["schedule"]["warmup_frac_of_1x"], Phase-I tunable over {0, 0.02, 0.05, 0.1}.
-    # At the 5% default: 122 (LM), 176 (MLP). See §9 note on the budget curve's warmup.
+    # cfg["schedule"]["warmup_frac_of_1x"] is FIXED at 0.05 for every optimizer and
+    # every run, including the budget curve: 122 (LM), 176 (MLP). Warmup is not
+    # tuned (Gate-1 decision, DEVIATIONS.md #6 - deliberate departure from Wen
+    # et al., who tune it).
 def branch_steps(base_steps_1x: int, mult: float) -> int   # round(mult * base_steps_1x)
 def checkpoint_step(base_steps_1x: int, mult: float) -> int
     # round(0.8 * branch_steps(base, mult)) — the exact step in the CONSTANT run at
@@ -336,16 +339,18 @@ def ns_matrix_flops(shape: torch.Size, iters: int) -> int
     # k * (4*m^2*n + 2*m^3), m = min(dims), n = max(dims)  (PLAN Protocol formula)
 def optimizer_flops_per_step(param_groups: ParamGroups, optimizer: str,
                              ns_steps: int, msign_steps: int = 10,
-                             dual_steps: float | None = None) -> int
+                             msign_calls: float | None = None) -> int
     # muon/moonlight/muonall: sum of ns_matrix_flops over muon-group matrices (iters =
     #   ns_steps), incl. MuonAll's tied embedding counted once (Clarification 4);
     #   ns_vec and AdamW terms ~10 flops/param, included but negligible.
     # manifold: ns_matrix_flops with iters = msign_steps, multiplied by
-    #   (dual_steps + 2)  — dual ascent per step taken, + final msign of the update
-    #   direction + retraction. `dual_steps` MUST be the logged mean of steps actually
+    #   msign_calls — the number of msign invocations the optimizer actually made
+    #   (ascent calls incl. the early-stop check call, + retraction), reported by
+    #   ManifoldMuon.step() itself as "msign_calls" (Gate 1, DEVIATIONS.md #7);
+    #   never derived from the logged dual steps. dual_steps stays logged
     #   taken (never the cap).
 def run_flops(result: dict) -> dict        # {"model": int, "optimizer": int, "total": int}
-    # computed from a result JSON, using its logged per-eval dual-step means.
+    # computed from a result JSON, using its logged per-eval msign_calls_mean (actual msign invocations; DEVIATIONS.md #7 — never dual_steps).
 def verify_against_counter(model, optimizer, batch) -> tuple[int, int]
     # (analytic, FlopCounterMode around fwd+bwd+step); test asserts |ratio-1| <= 0.05.
 BREAK_EVEN = lambda cfg: ...   # token speedup needed to win per FLOP (H2a reporting)
@@ -393,7 +398,7 @@ def load_checkpoint(path) -> dict
 {"t":"eval", "step":176, "images_or_tokens":45056, "lr":..., "train_loss":...,
  "val_loss":..., "val_acc":..., "grad_norm":..., "max_attn_logit":...,
  "expert_entropy":..., "expert_share_min":..., "expert_share_max":...,
- "aux_loss":..., "dual_steps_mean":..., "dual_residual_mean":...}
+ "aux_loss":..., "dual_steps_mean":..., "dual_residual_mean":..., "msign_calls_mean":...}
 {"t":"ckpt", "step":1408, "path":"checkpoints/..."}
 {"t":"final", "val_loss":..., "test_loss":..., "test_acc":...,
  "spectral_norms":{name:...}, "flops":{"model":...,"optimizer":...,"total":...}}
@@ -405,7 +410,7 @@ def load_checkpoint(path) -> dict
 {"hash":..., "schema_version":1, "config":{...}, "status":"completed"|"diverged",
  "diverged_at_step":null|int, "final_val_loss":..., "final_val_acc":...,
  "final_test_loss":..., "final_test_acc":..., "train_val_gap":...,
- "flops":{"model":...,"optimizer":...,"total":...}, "dual_steps_mean":...,
+ "flops":{"model":...,"optimizer":...,"total":...}, "dual_steps_mean":..., "msign_calls_mean":...,
  "edge_rule_fired":bool, "device":"mps|cpu|cuda", "precision":"fp32",
  "torch_version":..., "transformers_version":..., "wall_clock_s":...,
  "git_commit":..., "started_at":..., "finished_at":...}
@@ -457,13 +462,12 @@ PHASE2_DONOR = {"mlp256": "mlp128", "mlp512": "mlp128", "moe": "dense"}
 def build_dag(study: str, results: ResultsView) -> list[Phase]      # §6
 
 # ---- Phase I: coordinate descent (mlp128 and dense only; PLAN "Hyperparameter search")
-CD_ORDER = ("lr", "wd", "warmup", "momentum", "beta2", "clip")
+CD_ORDER = ("lr", "wd", "momentum", "beta2", "clip")  # NO warmup: fixed 5% (Gate 1, DEVIATIONS.md #6)
 CD_GRIDS = {
     "lr":       "6-point factor-2 grid around the current value",
     "wd":       (0.0, "0.3*d", "d", "3*d"),            # d = plain default (answer 3);
                                                        # manifold: skipped (no wd on
                                                        # constrained matrices)
-    "warmup":   (0.0, 0.02, 0.05, 0.10),               # fraction of 1x steps
     "momentum": (0.9, 0.95, 0.98),                     # Muon family; AdamW instead
                                                        # sweeps beta1 (0.8, 0.9, 0.95)
     "beta2":    (0.95, 0.99, 0.999),                   # AdamW only
@@ -640,7 +644,7 @@ seq_len: null              # * 256 for LM, null for MLP
 grad_clip: 1.0             # * Phase-I tunable over {null (off), 0.5, 1.0}
 schedule:                  # *
   kind: wsd
-  warmup_frac_of_1x: 0.05  #   warmup steps always absolute from the 1x budget; Phase-I
+  warmup_frac_of_1x: 0.05  #   warmup steps always absolute from the 1x budget; FIXED
                            #   tunable over {0, 0.02, 0.05, 0.1}
   decay_frac: 0.2          #   linear decay to 0 over the last 20% of THIS run's budget
 precision: fp32            # * fp32|tf32; uniform within a study
@@ -667,8 +671,8 @@ two configs agreeing on them must produce statistically identical results, so th
 share a result file (idempotency), and two configs differing in any of them must not
 collide (no silent reuse of a stale result after a decision change — `schema_version`
 exists to force a global invalidation when semantics change without a field changing).
-Every hyperparameter Phase-I coordinate descent can vary — lr, wd, warmup
-(`schedule.warmup_frac_of_1x`), momentum, `adamw_betas`, `grad_clip` — is a hashed
+Every hyperparameter Phase-I coordinate descent can vary — lr, wd, momentum,
+`adamw_betas`, `grad_clip` (NOT warmup: fixed 5%, Gate 1) — is a hashed
 field, so each coordinate-descent trial has its own identity and duplicate cells
 (e.g. the current value re-appearing in a later sweep) deduplicate automatically.
 Logged-only fields vary with *where and when* the run executes: "device" in the
@@ -712,21 +716,21 @@ pilot (adamw default, seeds 101-103; mlp128, mlp512, dense)
   ├─> sets the SINGLE n_final_seeds ∈ {3, 5} for ALL five studies
   └─> sets this study's cd_accept threshold (2 × pilot seed std)   [gates Phase I]
 
-adamw_cd:  lr(6+edge) ─> wd(4) ─> warmup(4) ─> β1(3) ─> β2(3) ─> clip(3) ─> pass 2?
+adamw_cd:  lr(6+edge) ─> wd(4) ─> β1(3) ─> β2(3) ─> clip(3) ─> pass 2?
                 │  (each sweep is a Phase needing the previous; ≤2 passes, early stop)
                 v
      [adamw Phase-I values = adamw best]                 ──> adamw_fresh (seeds 1-3|1-5)
                 │                                                  │
-                ├──> muon_cd:     lr ─> wd ─> warmup ─> momentum ─> clip ─> ...
+                ├──> muon_cd:     lr ─> wd ─> momentum ─> clip ─> ...
                 │        └─> muon_fresh ─> init_ablation, muon_faithful (bf16 NS)
-                └──> manifold_cd: lr ─> warmup ─> momentum ─> clip ─> ...   (no wd)
+                └──> manifold_cd: lr ─> momentum ─> clip ─> ...   (no wd)
                          └─> manifold_fresh ─> manifold_faithful (100 dual steps)
                 v
      budget_constant (2x, curve seeds) ─> budget_branches ─> budget_halflr (seed 1
        first; promoted to every curve seed only if it beats seed 1's branched 2x)
 
-moonlight_cd: lr ─> wd ─> warmup ─> momentum ─> clip ─> ... ─> moonlight_fresh
-muonall_cd:   lr ─> wd ─> warmup ─> momentum ─> clip ─> ... ─> muonall_fresh
+moonlight_cd: lr ─> wd ─> momentum ─> clip ─> ... ─> moonlight_fresh
+muonall_cd:   lr ─> wd ─> momentum ─> clip ─> ... ─> muonall_fresh
                                                                  └─> muonall_faithful
 (moonlight/muonall have no AdamW group, so their descents run parallel to AdamW's;
  muon/manifold wait for AdamW's Phase-I values — AdamW goes first.)
@@ -735,7 +739,7 @@ muonall_cd:   lr ─> wd ─> warmup ─> momentum ─> clip ─> ... ─> muona
 **Phase-II studies (mlp256, mlp512, moe) — 12-trial lr × wd recipe:**
 
 ```
-[donor Phase I complete: mlp128 for widths, dense for moe]  ──┐  (inherited warmup,
+[donor Phase I complete: mlp128 for widths, dense for moe]  ──┐  (inherited
 pilot (mlp512 only, seeds 101-103)                            │   momentum, betas, clip
                                                               v   per optimizer)
 adamw_stage_a (6) ─> adamw_edge (≤2, lr only) ─> adamw_stage_b (6: 2 lrs × wd
@@ -792,8 +796,8 @@ work deterministically. Crashes lose at most the in-flight run.
 Budgets (base 1×): MLP 3,520 steps × 256 images = 901,120 images; LM 2,441 steps × 8,192
 tokens ≈ 20M tokens. Warmup is **always** an absolute step count from the 1× budget
 (`round(w × base_1x_steps)`; 176 MLP / 122 LM at the 5% default), identical for every
-branch and the 2× runs, so all budget points share warmup. Note: PLAN's budget-curve
-rows fix w = 0.05, while Phase I can now tune AdamW's warmup fraction — see the §9 note;
+branch and the 2× runs, so all budget points share warmup. Warmup is fixed at 5%
+for every optimizer and every budget (Gate-1 decision, DEVIATIONS.md #6);
 the design keeps w as a hashed config field either way.
 
 For a run with `budget_multiplier` m: `total = round(m × base)`; lr is constant (after
@@ -839,7 +843,7 @@ Sanity inequality: warmup (0.05×base) < smallest branch point (0.8 × 0.125 × 
 | `tests/test_param_groups.py` | map complete + disjoint; dense muon fraction ≈ 69%; MLP > 99%; MoE 16×3 separate expert matrices; router placement per optimizer |
 | `tests/test_manifold.py` | retraction keeps WᵀW ≈ I (Stiefel stay); phase-1 equivalence: adapted `ManifoldMuon` with zero momentum and reference cap reproduces the unmodified `third_party` update; batched experts ≡ per-matrix; cap respected + steps-taken logged; vendored `msign.py` identical to `third_party` |
 | `tests/test_models.py` | dense = 1.70M params; MoE unfused in 4.57.6; seed reproducibility of init |
-| `tests/test_flops.py` | analytic vs `FlopCounterMode` within 5%; NS formula; Manifold FLOPs use logged dual steps |
+| `tests/test_flops.py` | analytic vs `FlopCounterMode` within 5%; NS formula; Manifold FLOPs use logged msign_calls (DEVIATIONS.md #7) |
 | `tests/test_schedule.py` | branch prefix equivalence; warmup fixed to 1×; decay over last 20% to exactly 0; checkpoint-step arithmetic |
 | `tests/test_data.py` | CIFAR train/val/test disjoint and sliced at C[1,802,240:1,822,240] of part0‖part1; single pass no repeats; seed sets order; 1× order is prefix of 2× order; FineWeb counts/dtype (≥45M, 2M, uint16, vocab 4096 incl. EOS); one EOS after each document; tokenizer trained on train docs only (meta flag) |
 | `tests/test_runner.py` | hash stable under key order; logged-only fields don't change hash; every hashed field does; skip-if-done; `hash % 4` partition |

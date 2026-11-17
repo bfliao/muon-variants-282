@@ -19,4 +19,27 @@
 - Oracle Stage 2 done: over seeds 42-44, Manifold Muon (lr 0.1) train 61.64 ± 0.20 /
   test 51.73 ± 0.53 beats AdamW (lr 3e-3) train 52.00 ± 0.49 / test 48.66 ± 0.30;
   singular values on-manifold every seed. Phase 1 pass criteria all met.
-- Gate 1 report sent; waiting for go-ahead to Phase 2.
+- Gate 1 passed (commit tagged gate-1). Phase 2 underway.
+
+## Phase 2 module status
+- APPROVED: msign/manifold (+msign_calls), optim core (torch-oracle-verified),
+  schedule+flops (FlopCounterMode-exact), data (re-review after 2 fixes:
+  fineweb resume reconciliation, fixed 156,224-window pool).
+- Datasets built: fineweb (45.0M train / 2M val tokens, v fineweb-edu-10bt-v1-5d037df9),
+  cifar5m (1,802,240/10k/10k, v cifar5m-v1-b7ab24de). Disk note: machine at ~98%,
+  9.8 GiB free after deleting the re-downloadable .npz archives.
+- APPROVED (cont.): models + param groups (dense 1,706,368 params, muon 69.13%;
+  MLP >99%; MoE unfused, router=mlp.gate; membership verified by exhaustive
+  enumeration, 15/15 pairs); analysis (after 7 review fixes: tuning-only
+  divergence rate, Phase-I "cd" support, overflow-safe inversion, H6/H3 edges,
+  contiguous basin). Note for studies.py: always emit the cd_sweep config field.
+- APPROVED (cont.): train.py + run-identity layer (after 2 fixes: unique-tmp atomic
+  writes with corrupt-result recovery, hashed schedule fields honored; plus
+  map_location hardening); runner/studies/configs/smoke+timing (after 3 fixes:
+  manifold cap+1 scaling, smoke per-unit failure isolation, exclude_optimizers
+  cut lever).
+- Gate-2 consolidated checklist audit: every line ticked (18 exact, 54 name-drift
+  corrected in place, 1 deferred to Phase 6, 3 flags all closed: script tests,
+  edge_trial observability, trial_counts test). All 14 known traps verified
+  neutralized with file:line evidence.
+- Gate 2 report sent; waiting for go-ahead to Phase 3 (smoke + timing runs).
