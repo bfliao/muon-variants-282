@@ -1,0 +1,5 @@
+repo: https://github.com/thinking-machines-lab/manifolds
+commit: 89dcae50f01af59f1e0570289474da3a2ecaa60b
+commit date: 2025-09-26 09:50:41 -0700
+files: LICENSE src/main.py src/manifold_muon.py src/msign.py src/hyperspherical_descent.py
+vendored unmodified (byte-for-byte)
