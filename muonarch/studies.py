@@ -166,7 +166,11 @@ _RULES = {"adamw": None, "muon": "keller", "moonlight": "moonlight",
 # ---------------------------------------------------------------------------
 # final-seed count (Gate-0 answer 6: ONE count for all five studies)
 
-_FINAL_SEED_COUNT = 3
+# Gate 4 (2026-11-17, Paul): 5 final seeds. Large pilot spread (dense AdamW
+# pilot std 0.029) and several 3-seed comparisons sat at the seed-rule
+# threshold (PLAN Decisions log "Null results"). DAG-only change: seeds 1-3
+# job hashes are unchanged; seeds 4-5 are new jobs.
+_FINAL_SEED_COUNT = 5
 
 
 def set_final_seed_count(n: int) -> None:

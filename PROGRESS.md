@@ -71,3 +71,6 @@ Question: is "Manifold Muon worse than AdamW" a bug/tuning artefact? Finding: no
 - Open protocol point for Paul: Manifold gains ~0.02 from a larger AdamW-group lr, which the frozen protocol pins to AdamW's tuned lr. Not changed.
 Scripts/outputs: session scratchpad (diag_manifold.py, ref_regime.py, diag/summary.jsonl) — not in the repo.
 - Follow-up (Paul): Muon with AdamW-group lr ×16 on MLP-128 seed 0 = 0.8058 (vs 0.7981) -> the classifier-lr sensitivity is Manifold-specific. Audit write-up in docs/manifold_audit.md; scripts moved to scripts/diag_manifold.py and scripts/diag_ref_regime.py; outputs in logs/diagnostics/manifold_audit/; DEVIATIONS #13. Fixed .gitignore (".claude" and "hardware-results.csv" had been merged onto one line).
+
+## 2026-11-17 — Gate 4: 5 final seeds (Paul)
+_FINAL_SEED_COUNT = 5 (DAG-only; seeds 1-3 hashes unchanged). New jobs: 10 fresh-seed runs per study (seeds 4-5 x 5 optimizers) plus the AdamW budget curve for seeds 4-5 once those land. Launched: MLP chain (mlp128 -> mlp256 -> mlp512, one CIFAR process at a time) in parallel with dense. MoE still deferred. Loss vs accuracy note added to PLAN Decisions log.
