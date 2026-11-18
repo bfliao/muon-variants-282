@@ -1,0 +1,14 @@
+{"name": "baseline_replica", "val": 0.9155797973632812, "test_acc": 0.6673, "status": "completed", "gap": 0.02466606975089425, "wall": 60.578898906707764, "hash": "3aefd5218c0a"}
+{"name": "cap0_projection_only", "val": 0.9286313293457031, "test_acc": 0.6653, "status": "completed", "gap": 0.027282712528380437, "wall": 25.673716068267822, "hash": "3e274cd169fd"}
+{"name": "momentum0", "val": 1.0331741271972656, "test_acc": 0.6307, "status": "completed", "gap": 0.01457099698565223, "wall": 59.69905996322632, "hash": "01ac8fab46b2"}
+{"name": "adamw_group_lr_x4", "val": 0.9003774780273438, "test_acc": 0.6739, "status": "completed", "gap": 0.026069009591774495, "wall": 54.96148991584778, "hash": "fc344ce3b49f"}
+{"name": "adamw_group_lr_x16", "val": 0.8939756652832032, "test_acc": 0.6704, "status": "completed", "gap": 0.027101834390921953, "wall": 52.42582893371582, "hash": "74125030f019"}
+{"name": "adamw_group_wd0", "val": 0.9085047485351563, "test_acc": 0.6675, "status": "completed", "gap": 0.02782619305523959, "wall": 54.266963958740234, "hash": "dfb81993607e"}
+{"name": "muon_seed0_reference", "val": 0.7980877075195313, "test_acc": 0.6965, "status": "completed", "gap": 0.04136091550100929, "wall": 13.711765766143799, "hash": "6d650fb5a242"}
+{"name": "scale2.8", "val": 0.9433444763183594, "test_acc": 0.6576, "status": "completed", "gap": 0.027484015198729228, "wall": 64.6527328491211, "hash": "3aefd5218c0a"}
+{"name": "scale2.8_lr_x4", "val": 0.9616924438476563, "test_acc": 0.6521, "status": "completed", "gap": 0.021636618248440986, "wall": 63.40610599517822, "hash": "fc344ce3b49f"}
+{"name": "scale8", "val": null, "test_acc": null, "status": "diverged", "gap": null, "wall": 3.554344892501831, "hash": "3aefd5218c0a"}
+{"name": "scale0.35", "val": 1.19106611328125, "test_acc": 0.5954, "status": "completed", "gap": 0.01746867675239394, "wall": 88.8062002658844, "hash": "3aefd5218c0a"}
+{"name": "adamw_group_lr_x16_wd0", "val": 0.8941976257324219, "test_acc": 0.6697, "status": "completed", "gap": 0.02966719473166901, "wall": 67.18853211402893, "hash": "a0d8122d9dda"}
+{"name": "adamw_group_lr_x64", "val": 0.9048557556152343, "test_acc": 0.6687, "status": "completed", "gap": 0.03421146554675969, "wall": 67.08296179771423, "hash": "6282e9575087"}
+{"name": "muon_adamw_group_lr_x16", "val": 0.8057758239746093, "test_acc": 0.6971, "status": "completed", "gap": 0.03730335250280126, "wall": 18.54661202430725, "hash": "e3b7031f622a"}

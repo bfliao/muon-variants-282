@@ -1,0 +1,75 @@
+{
+ "hash": "28302de2516d",
+ "schema_version": 1,
+ "config": {
+  "schema_version": 1,
+  "study": "mlp512",
+  "phase": "fresh_seed",
+  "arch": "mlp",
+  "width": 512,
+  "optimizer": "moonlight",
+  "rule": "moonlight",
+  "lr": 0.001,
+  "wd": 0.1,
+  "momentum": 0.9,
+  "adamw_betas": [
+   0.9,
+   0.95
+  ],
+  "adamw_eps": 1e-08,
+  "adamw_group_lr": null,
+  "adamw_group_wd": null,
+  "ns_steps": 5,
+  "ns_dtype": "fp32",
+  "manifold": null,
+  "init_projection": false,
+  "seed": 3,
+  "budget_multiplier": 1.0,
+  "branch": null,
+  "budget_base_steps": 3520,
+  "budget_unit": "images",
+  "batch": 256,
+  "seq_len": null,
+  "grad_clip": 1.0,
+  "schedule": {
+   "kind": "wsd",
+   "warmup_frac_of_1x": 0.05,
+   "decay_frac": 0.2
+  },
+  "precision": "fp32",
+  "router_aux_loss_coef": null,
+  "eval": {
+   "every_steps": 176,
+   "val_small_tokens": null,
+   "val_final": "full"
+  },
+  "data": {
+   "dataset": "cifar5m",
+   "version": "cifar5m-v1-b7ab24dec8fd"
+  }
+ },
+ "status": "completed",
+ "diverged_at_step": null,
+ "final_val_loss": 0.6622470947265625,
+ "final_val_acc": 0.7685,
+ "final_test_loss": 0.7013533325195312,
+ "final_test_acc": 0.7526,
+ "train_val_gap": 0.03916387279142031,
+ "flops": {
+  "model": 11366396067840,
+  "optimizer": 89838870880000,
+  "total": 101205266947840
+ },
+ "dual_steps_mean": null,
+ "msign_calls_mean": null,
+ "edge_rule_fired": null,
+ "wall_clock_s": 40.835708141326904,
+ "started_at": "2026-11-18T01:11:50.311044+00:00",
+ "finished_at": "2026-11-18T01:12:31.146763+00:00",
+ "device": "mps",
+ "hostname": "MacBook-Pro-de-Paul-2.local",
+ "precision": "fp32",
+ "torch_version": "2.15.0",
+ "transformers_version": "4.57.6",
+ "git_commit": "9bfe3f41f7bc512e371780d722bb97669afc8356"
+}

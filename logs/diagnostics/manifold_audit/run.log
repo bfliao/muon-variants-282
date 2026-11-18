@@ -1,0 +1,75 @@
+/Users/paulruiz/Documents/282_project/muonarch/train.py:310: UserWarning: linalg.svd: matrix too large to stage in MPS threadgroup memory (1572864 > 32768 bytes); falling back to CPU. (Triggered internally at /Users/runner/work/pytorch/pytorch/aten/src/ATen/native/mps/operations/LinearAlgebra.mm:2288.)
+  return float(torch.linalg.svdvals(W.detach().float())[0])
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'baseline_replica', 'val': 0.9155797973632812, 'test_acc': 0.6673, 'status': 'completed', 'gap': 0.02466606975089425, 'wall': 60.578898906707764, 'hash': '3aefd5218c0a'}
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'cap0_projection_only', 'val': 0.9286313293457031, 'test_acc': 0.6653, 'status': 'completed', 'gap': 0.027282712528380437, 'wall': 25.673716068267822, 'hash': '3e274cd169fd'}
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'momentum0', 'val': 1.0331741271972656, 'test_acc': 0.6307, 'status': 'completed', 'gap': 0.01457099698565223, 'wall': 59.69905996322632, 'hash': '01ac8fab46b2'}
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'adamw_group_lr_x4', 'val': 0.9003774780273438, 'test_acc': 0.6739, 'status': 'completed', 'gap': 0.026069009591774495, 'wall': 54.96148991584778, 'hash': 'fc344ce3b49f'}
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'adamw_group_lr_x16', 'val': 0.8939756652832032, 'test_acc': 0.6704, 'status': 'completed', 'gap': 0.027101834390921953, 'wall': 52.42582893371582, 'hash': '74125030f019'}
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'adamw_group_wd0', 'val': 0.9085047485351563, 'test_acc': 0.6675, 'status': 'completed', 'gap': 0.02782619305523959, 'wall': 54.266963958740234, 'hash': 'dfb81993607e'}
+{'name': 'scale2.8', 'val': 0.9155797973632812, 'test_acc': 0.6673, 'status': 'completed', 'gap': 0.02466606975089425, 'wall': 60.578898906707764, 'hash': '3aefd5218c0a'}
+{'name': 'scale2.8_lr_x4', 'val': 0.9003774780273438, 'test_acc': 0.6739, 'status': 'completed', 'gap': 0.026069009591774495, 'wall': 54.96148991584778, 'hash': 'fc344ce3b49f'}
+0.weight  muon   (128, 3072)        393,216
+2.weight  muon   (128, 128)          16,384
+4.weight  muon   (128, 128)          16,384
+0.bias    adamw  (128,)                 128
+2.bias    adamw  (128,)                 128
+4.bias    adamw  (128,)                 128
+6.weight  adamw  (10, 128)            1,280
+6.bias    adamw  (10,)                   10
+fractions: muon 0.9961  adamw 0.0039
+{'name': 'muon_seed0_reference', 'val': 0.7980877075195313, 'test_acc': 0.6965, 'status': 'completed', 'gap': 0.04136091550100929, 'wall': 13.711765766143799, 'hash': '6d650fb5a242'}
+DIAG DONE

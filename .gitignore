@@ -2,8 +2,15 @@
 __pycache__/
 *.pyc
 data/
-results/
-logs/
+# Run outputs: result JSONs and per-run logs ARE tracked (small; needed to rebuild
+# figures and tables). Driver logs, oracle logs and checkpoints are not.
+logs/*
+!logs/mlp128/
+!logs/mlp256/
+!logs/mlp512/
+!logs/dense/
+!logs/moe/
+!logs/diagnostics/
 checkpoints/
 .pytest_cache/
 *.egg-info/
