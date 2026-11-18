@@ -748,3 +748,179 @@ def test_divergence_rate_uses_headline_track_only():
     assert an.divergence_rate("mlp256", "adamw", df2) == 0.0
     assert an.headline_tuning_phases(df2, "mlp256") == ("cd",)
     assert an.headline_tuning_phases(df2, "moe") == ("stage_a", "stage_b", "edge")
+
+
+# ------------------------------------- headline-only diagnostics (H7, fig 8)
+
+def _smoke_moe_logs(root: Path) -> None:
+    """MoE smoke runs only (seed 0, one per optimizer): what the real logs
+    held before any MoE study ran."""
+    for opt in an.OPTIMIZERS:
+        cfg = _cfg("moe", opt, "smoke", 0, BEST_LR[opt], 0.01, 1.0)
+        h = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12]
+        _write_log(root, cfg, h, MOE_FRESH[opt])
+
+
+def _h7(out: pd.DataFrame) -> pd.Series:
+    return out[out["hypothesis"] == "H7"].iloc[0]
+
+
+def test_h7_ignores_smoke_logs(df, tmp_path):
+    _smoke_moe_logs(tmp_path)
+    smoke = an.load_logs(tmp_path)
+    assert set(smoke["phase"]) == {"smoke"}
+    row = _h7(an.hypothesis_verdicts(df, logs=smoke))
+    assert row["verdict"] == "indistinguishable"
+    assert row["quantity"].startswith("insufficient data")
+
+
+def test_h7_uses_fresh_seed_logs(df, logs, tmp_path):
+    # world fresh-seed MoE logs give a real verdict; adding smoke logs with
+    # extreme entropy must not change it
+    base = _h7(an.hypothesis_verdicts(df, logs=logs))
+    assert base["verdict"] in {"supported", "falsified"}
+    assert not base["quantity"].startswith("insufficient")
+    _smoke_moe_logs(tmp_path)
+    smoke = an.load_logs(tmp_path)
+    smoke.loc[smoke["optimizer"] == "muon", "expert_entropy"] = 99.0
+    mixed = pd.concat([logs, smoke], ignore_index=True)
+    row = _h7(an.hypothesis_verdicts(df, logs=mixed))
+    assert row["verdict"] == base["verdict"]
+    assert row["quantity"] == base["quantity"]
+
+
+def _polluted(logs: pd.DataFrame) -> pd.DataFrame:
+    """World logs plus non-headline copies (smoke, cd, 2x budget) of the
+    fresh-seed rows carrying extreme values."""
+    fresh = logs[logs["phase"] == "fresh_seed"]
+    extra = []
+    for phase, mult in (("smoke", 1.0), ("cd", 1.0), ("budget_constant", 2.0)):
+        e = fresh.copy()
+        e["phase"], e["budget_multiplier"], e["seed"] = phase, mult, 0
+        ev = e["t"] == "eval"
+        e.loc[ev, "max_attn_logit"] = 1e6
+        e.loc[ev & e["expert_entropy"].notna(), "expert_entropy"] = -1e6
+        fin = e.index[e["t"] == "final"]
+        e.loc[fin, "spectral_norms"] = pd.Series(
+            [{"layer0.weight": 1e6, "bogus.weight": 1e6}] * len(fin), index=fin)
+        extra.append(e)
+    return pd.concat([logs] + extra, ignore_index=True)
+
+
+def test_figure8_data_ignores_non_fresh_rows(logs):
+    dirty = _polluted(logs)
+    attn, attn_d = an.attn_logit_curves(logs), an.attn_logit_curves(dirty)
+    pd.testing.assert_frame_equal(attn, attn_d)
+    assert attn["max_attn_logit"].max() < 10
+    assert set(attn["study"]) == {"dense", "moe"}
+    # mean over the 3 fresh seeds at every point
+    assert (attn["n_seeds"] == 3).all()
+    ent, ent_d = an.expert_entropy_curves(logs), an.expert_entropy_curves(dirty)
+    pd.testing.assert_frame_equal(ent, ent_d)
+    assert set(ent["study"]) == {"moe"} and ent["expert_entropy"].min() > 0
+    study, sn = an.spectral_norm_means(logs)
+    study_d, sn_d = an.spectral_norm_means(dirty)
+    assert study == study_d == "dense"
+    pd.testing.assert_frame_equal(sn, sn_d)
+    assert "bogus.weight" not in sn_d.index
+
+
+def test_figure8_data_smoke_only_is_empty(tmp_path):
+    _smoke_moe_logs(tmp_path)
+    smoke = an.load_logs(tmp_path)
+    assert an.attn_logit_curves(smoke).empty
+    assert an.expert_entropy_curves(smoke).empty
+    assert an.spectral_norm_means(smoke)[1].empty
+    p = an.figure_8(pd.DataFrame(), tmp_path / "figures", logs=smoke)
+    assert p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_spectral_norm_means_over_seeds_union_layers():
+    def row(opt, seed, sn, phase="fresh_seed"):
+        return dict(study="dense", optimizer=opt, phase=phase, seed=seed,
+                    budget_multiplier=1.0, t="final", spectral_norms=sn)
+    q0 = "model.layers.0.self_attn.q_proj.weight"
+    rows = [row("muon", 1, {q0: 2.0}), row("muon", 2, {q0: 4.0}),
+            row("muon", 0, {q0: 100.0}, phase="smoke"),
+            row("muonall", 1, {q0: 3.0, "model.embed_tokens.weight": 5.0}),
+            row("adamw", 1, {})]
+    study, sn = an.spectral_norm_means(pd.DataFrame(rows))
+    assert study == "dense"
+    assert list(sn.columns) == ["muon", "muonall"]       # adamw: no norms
+    assert list(sn.index) == ["model.embed_tokens.weight", q0]
+    assert sn.loc[q0, "muon"] == pytest.approx(3.0)      # mean of seeds 1, 2
+    assert np.isnan(sn.loc["model.embed_tokens.weight", "muon"])
+    assert sn.loc["model.embed_tokens.weight", "muonall"] == pytest.approx(5.0)
+
+
+def test_short_layer_name_and_numeric_order():
+    assert an.short_layer_name("model.layers.0.self_attn.q_proj.weight") == "L0.q"
+    assert an.short_layer_name("model.layers.3.mlp.gate_proj.weight") == "L3.gate"
+    assert an.short_layer_name("model.layers.5.self_attn.o_proj.weight") == "L5.o"
+    assert an.short_layer_name("model.embed_tokens.weight") == "embed"
+    names = [f"model.layers.{i}.{m}.weight"
+             for i in (10, 2, 0, 1)
+             for m in ("mlp.down_proj", "self_attn.k_proj", "mlp.gate_proj",
+                       "self_attn.q_proj", "mlp.up_proj", "self_attn.v_proj",
+                       "self_attn.o_proj")]
+    names.append("model.embed_tokens.weight")
+    short = [an.short_layer_name(n) for n in sorted(names, key=an.layer_sort_key)]
+    mods = ["q", "k", "v", "o", "gate", "up", "down"]
+    assert short == ["embed"] + [f"L{i}.{m}" for i in (0, 1, 2, 10) for m in mods]
+    # MoE experts: compact labels, experts sorted numerically after attention
+    assert an.short_layer_name(
+        "model.layers.0.mlp.experts.10.gate_proj.weight") == "L0.e10.gate"
+    moe = [f"model.layers.{i}.mlp.experts.{e}.{m}_proj.weight"
+           for i in (1, 0) for e in (10, 2, 0) for m in ("down", "up", "gate")]
+    moe += [f"model.layers.{i}.self_attn.{m}_proj.weight"
+            for i in (1, 0) for m in ("o", "q", "v", "k")]
+    short = [an.short_layer_name(n) for n in sorted(moe, key=an.layer_sort_key)]
+    assert short == [x for i in (0, 1) for x in
+                     [f"L{i}.{m}" for m in ("q", "k", "v", "o")]
+                     + [f"L{i}.e{e}.{m}" for e in (0, 2, 10)
+                        for m in ("gate", "up", "down")]]
+
+
+def test_partial_and_diagnostics_logs_never_counted(tmp_path):
+    """A stopped fresh_seed run (extra seed 4, no completed result) and a
+    parked run under logs/diagnostics/ must not be loaded or counted."""
+    for seed in (1, 2, 3):
+        cfg = _cfg("dense", "adamw", "fresh_seed", seed, BEST_LR["adamw"], 0.01, 1.0)
+        h, _ = _write_result(tmp_path, cfg, 3.5)
+        _write_log(tmp_path, cfg, h, 3.5)
+    # partial seed-4 run: log in logs/dense/, truncated, NO result JSON
+    cfg4 = _cfg("dense", "adamw", "fresh_seed", 4, BEST_LR["adamw"], 0.01, 1.0)
+    _write_log(tmp_path, cfg4, "partial00004", 3.5)
+    p4 = tmp_path / "logs" / "dense" / "partial00004.jsonl"
+    lines = p4.read_text().splitlines()
+    partial = [json.loads(x) for x in lines[:4]]  # start + 3 evals, stopped
+    for rec in partial[1:]:
+        rec["max_attn_logit"] = 1e6
+    p4.write_text("\n".join(json.dumps(x) for x in partial) + "\n")
+    # parked diagnostics runs: a seed-5 fresh_seed copy and a cd audit run
+    for name, phase, seed in (("discarded_seeds45/logs/dense", "fresh_seed", 5),
+                              ("manifold_audit/scale8", "cd", 0)):
+        cfg = _cfg("dense", "adamw", phase, seed, BEST_LR["adamw"], 0.01, 1.0)
+        _write_log(tmp_path, cfg, f"diag{seed}", 3.5)
+        src = tmp_path / "logs" / "dense" / f"diag{seed}.jsonl"
+        dst = tmp_path / "logs" / "diagnostics" / name / f"diag{seed}.jsonl"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+    # a jsonl nested one level deeper inside a study dir is not read either
+    nested = tmp_path / "logs" / "dense" / "old" / "x.jsonl"
+    nested.parent.mkdir()
+    nested.write_text(dst.read_text())
+
+    lg = an.load_logs(tmp_path)
+    res = an.load_results(tmp_path)
+    assert set(lg["hash"]) == set(res["hash"]) | {"partial00004"}
+    assert not lg["hash"].str.startswith("diag").any()
+    assert "cd" not in set(lg["phase"])
+    # without df the partial seed 4 is still a fresh_seed log...
+    assert an.attn_logit_curves(lg)["n_seeds"].max() == 4
+    # ...with df it is dropped: no completed result
+    attn = an.attn_logit_curves(lg, res)
+    assert (attn["n_seeds"] == 3).all()
+    assert attn["max_attn_logit"].max() < 10
+    _, sn = an.spectral_norm_means(lg, df=res)
+    assert list(sn.columns) == ["adamw"]

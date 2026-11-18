@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,18 @@ OPTIMIZER_COLORS: dict[str, str] = {
     "muonall": "#9467bd",
 }
 
+#: One fixed marker per optimizer, so coinciding series stay distinguishable.
+OPTIMIZER_MARKERS: dict[str, str] = {
+    "adamw": "o",
+    "muon": "s",
+    "moonlight": "^",
+    "manifold": "D",
+    "muonall": "v",
+}
+
+#: figure_5 horizontal dodge between adjacent optimizers, in log2-width units.
+_FIG5_DODGE = 0.06
+
 SEED_RULE_CAVEAT = "3-seed sign+2*std seed rule: a heuristic, not a test"
 
 _RESULT_CONFIG_FIELDS = (
@@ -90,6 +103,9 @@ def headline_tuning_phases(df: pd.DataFrame, study: str) -> tuple[str, ...]:
     seed 0 for H4 only — else the Phase-II phases. Headline quantities
     (basin, divergence rate, figures) never mix the two tracks."""
     return ("cd",) if _has_cd_rows(df, study) else PHASE2_TUNING_PHASES
+#: Top-level ``logs/`` subdirectories that load_logs never reads.
+_EXCLUDED_LOG_DIRS: frozenset[str] = frozenset({"diagnostics"})
+
 _RESULT_TOP_FIELDS = (
     "hash", "status", "diverged_at_step", "final_val_loss", "final_val_acc",
     "final_test_loss", "final_test_acc", "train_val_gap", "dual_steps_mean",
@@ -144,10 +160,19 @@ def load_logs(root: Path | str) -> pd.DataFrame:
     record, plus the record's own fields.  The eval record's instantaneous
     learning rate is renamed to ``lr_step`` so it does not clobber the config
     ``lr``.  ``final`` records keep ``spectral_norms`` as a dict cell.
+
+    Only TOP-LEVEL study directories are read: ``logs/<study>/*.jsonl``.
+    Nothing nested deeper is loaded, and ``logs/diagnostics/`` is skipped
+    entirely — it holds parked, unused runs (e.g. the stopped seed-4/5
+    fresh_seed runs in ``diagnostics/discarded_seeds45`` and the Manifold
+    audit runs, phase "cd" seed 0, in ``diagnostics/manifold_audit``) that
+    must never enter any analysis.
     """
     root = Path(root)
     rows = []
-    for p in sorted((root / "logs").rglob("*.jsonl")):
+    for p in sorted((root / "logs").glob("*/*.jsonl")):
+        if p.parent.name in _EXCLUDED_LOG_DIRS:
+            continue
         base: dict = {"hash": None}
         for line in p.read_text().splitlines():
             line = line.strip()
@@ -690,6 +715,157 @@ def edge_rule_report(df: pd.DataFrame) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Log selection (headline fresh-seed runs only)
+
+def _completed_fresh_hashes(df: pd.DataFrame | None) -> set | None:
+    """Hashes of completed fresh-seed 1x results, or None when no usable
+    results frame is given (no filtering possible)."""
+    if df is None or df.empty or not {"hash", "study"} <= set(df.columns):
+        return None
+    m = (df["phase"] == "fresh_seed") & (df["status"] == "completed")
+    if "budget_multiplier" in df.columns:
+        m &= df["budget_multiplier"] == 1.0
+    return set(df.loc[m, "hash"].dropna())
+
+
+def _fresh_logs(logs: pd.DataFrame | None, t: str | None = None,
+                df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Log rows of the headline fresh-seed 1x runs (phase "fresh_seed",
+    budget_multiplier 1 where the column exists), optionally one record
+    type ``t`` ("eval"/"final").  Smoke, pilot, tuning, budget-curve,
+    faithful and init-ablation runs are excluded: diagnostics and H7 describe
+    the tuned headline runs only.
+
+    Defence in depth: when a results frame ``df`` is given, only logs whose
+    hash belongs to a COMPLETED fresh-seed 1x result are kept, so a stopped
+    or partial fresh_seed run (no completed result JSON) never counts as a
+    seed."""
+    if logs is None or logs.empty or "phase" not in logs.columns:
+        return pd.DataFrame()
+    m = logs["phase"] == "fresh_seed"
+    keep = _completed_fresh_hashes(df)
+    if keep is not None:
+        m &= logs["hash"].isin(keep) if "hash" in logs.columns else False
+    if "budget_multiplier" in logs.columns:
+        m &= logs["budget_multiplier"] == 1.0
+    if t is not None:
+        m &= logs["t"] == t
+    return logs[m]
+
+
+def _eval_curves(logs: pd.DataFrame | None, metric: str,
+                 studies: tuple[str, ...],
+                 df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Per (study, optimizer, images_or_tokens): ``metric`` averaged over the
+    fresh seeds.  Columns: study, optimizer, images_or_tokens, <metric>,
+    n_seeds."""
+    cols = ["study", "optimizer", "images_or_tokens", metric, "n_seeds"]
+    ev = _fresh_logs(logs, "eval", df)
+    if ev.empty or metric not in ev.columns:
+        return pd.DataFrame(columns=cols)
+    ev = ev[ev["study"].isin(studies) & ev[metric].notna()]
+    if ev.empty:
+        return pd.DataFrame(columns=cols)
+    out = (ev.groupby(["study", "optimizer", "images_or_tokens"])
+           .agg(**{metric: (metric, "mean"), "n_seeds": ("seed", "nunique")})
+           .reset_index())
+    return out[cols]
+
+
+def attn_logit_curves(logs: pd.DataFrame | None,
+                      df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """figure_8 (a) data: fresh-seed max attention logit, mean over seeds,
+    per study (dense, moe) x optimizer x token count.  With ``df``, only
+    runs with a completed fresh-seed result count (``_fresh_logs``)."""
+    return _eval_curves(logs, "max_attn_logit", STUDY_B, df)
+
+
+def expert_entropy_curves(logs: pd.DataFrame | None,
+                          df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """figure_8 (b) data: fresh-seed MoE expert-share entropy, mean over
+    seeds, per optimizer x token count.  ``df`` as in attn_logit_curves."""
+    return _eval_curves(logs, "expert_entropy", ("moe",), df)
+
+
+_MODULE_ORDER = ("q", "k", "v", "o", "gate", "up", "down")
+
+
+def short_layer_name(name: str) -> str:
+    """'model.layers.3.mlp.gate_proj.weight' -> 'L3.gate';
+    'model.layers.0.self_attn.q_proj.weight' -> 'L0.q';
+    'model.layers.0.mlp.experts.10.up_proj.weight' -> 'L0.e10.up';
+    'model.embed_tokens.weight' -> 'embed'."""
+    s = name
+    if s.endswith(".weight"):
+        s = s[: -len(".weight")]
+    s = s.replace("model.layers.", "L")
+    for tok in ("self_attn.", "mlp."):
+        s = s.replace(tok, "")
+    s = s.replace("experts.", "e")
+    s = s.replace("_proj", "")
+    if s.startswith("model."):
+        s = s[len("model."):]
+    if s == "embed_tokens":
+        s = "embed"
+    return s
+
+
+def layer_sort_key(name: str):
+    """Sort key putting matrices in network order: embeddings first, then
+    layers by NUMERIC index (L2 before L10), within a layer q/k/v/o then
+    gate/up/down (dense MLP), then MoE experts by NUMERIC expert index
+    (e2 before e10) each gate/up/down, then anything else (e.g. lm_head)
+    last."""
+    m = re.search(r"layers?\.?(\d+)", name)
+    short = short_layer_name(name)
+    if m is None:
+        group = -1 if "embed" in name else 10 ** 9
+        return (group, 0, -1, 0, short)
+    mod = short.split(".", 1)[1] if "." in short else ""
+    e = re.match(r"e(\d+)\.(.*)$", mod)
+    expert = -1
+    if e is not None:
+        expert, mod = int(e.group(1)), e.group(2)
+    rank = _MODULE_ORDER.index(mod) if mod in _MODULE_ORDER else len(_MODULE_ORDER)
+    # attention (q/k/v/o) precedes the MLP; dense MLP precedes experts
+    attn = rank < 4
+    return (int(m.group(1)), 0 if attn else 1, expert if not attn else -1,
+            rank, short)
+
+
+def spectral_norm_means(logs: pd.DataFrame | None,
+                        study: str | None = None,
+                        df: pd.DataFrame | None = None) -> tuple[str | None, pd.DataFrame]:
+    """figure_8 (c) data: final per-layer spectral norms of the fresh-seed
+    runs, MEAN over seeds.  Returns (study, frame) where the frame is indexed
+    by the full layer name in network order (``layer_sort_key``) over the
+    UNION of layers across optimizers, one column per optimizer, NaN where an
+    optimizer has no value (e.g. the embedding outside MuonAll).  Optimizers
+    with no spectral norms at all (AdamW logs an empty dict) are dropped.
+    ``study`` defaults to dense if present, else the first study with data."""
+    fin = _fresh_logs(logs, "final", df)
+    if fin.empty or "spectral_norms" not in fin.columns:
+        return None, pd.DataFrame()
+    fin = fin[fin["spectral_norms"].apply(lambda d: isinstance(d, dict) and len(d) > 0)]
+    if fin.empty:
+        return None, pd.DataFrame()
+    if study is None:
+        present = list(fin["study"].dropna().unique())
+        study = "dense" if "dense" in present else (
+            [s for s in STUDIES if s in present] or present)[0]
+    fin = fin[fin["study"] == study]
+    if fin.empty:
+        return study, pd.DataFrame()
+    cols = {}
+    for opt in [o for o in OPTIMIZERS if o in set(fin["optimizer"])]:
+        per_seed = pd.DataFrame(list(fin[fin["optimizer"] == opt]["spectral_norms"]))
+        cols[opt] = per_seed.apply(pd.to_numeric, errors="coerce").mean(axis=0)
+    out = pd.DataFrame(cols)
+    out = out.loc[sorted(out.index, key=layer_sort_key)]
+    return study, out
+
+
+# ---------------------------------------------------------------------------
 # Hypothesis verdicts
 
 def _best_variant(df: pd.DataFrame, study: str) -> str | None:
@@ -864,10 +1040,16 @@ def hypothesis_verdicts(df: pd.DataFrame, logs: pd.DataFrame | None = None) -> p
     try:
         if logs is None or logs.empty:
             raise ValueError("no logs provided")
-        ev = logs[(logs["t"] == "eval") & (logs["study"] == "moe")
-                  & logs["expert_entropy"].notna()]
+        # headline (fresh_seed) runs only: smoke/tuning/budget runs must
+        # never decide H7 (200-step smoke runs gave std 0 -> "supported")
+        # completed fresh-seed runs only (hash-matched against df), so a
+        # stopped run's last eval never stands in for a final value
+        ev = _fresh_logs(logs, "eval", df)
+        if "expert_entropy" not in ev.columns:
+            raise ValueError("no fresh_seed MoE expert-entropy logs")
+        ev = ev[(ev["study"] == "moe") & ev["expert_entropy"].notna()]
         if ev.empty:
-            raise ValueError("no MoE expert-entropy logs")
+            raise ValueError("no fresh_seed MoE expert-entropy logs")
         last = ev.sort_values("step").groupby(["optimizer", "seed"]).tail(1)
         g = last.groupby("optimizer")["expert_entropy"]
         means, stds = g.mean(), g.std(ddof=1).fillna(0.0)
@@ -1090,7 +1272,11 @@ def figure_5(df: pd.DataFrame, outdir: Path | str) -> Path:
         _no_data(ax2, "no MLP studies")
         return _save(fig, outdir, "fig5_width_transfer.png")
     widths = {s: float(_fresh(df, s)["width"].iloc[0]) for s in studies}
-    for opt in OPTIMIZERS:
+    # identical optima (e.g. muon == muonall at every width) would hide lines
+    # under each other: each optimizer gets its own marker and a small
+    # horizontal dodge in log2-width space (plotted values are unchanged)
+    n_opt = len(OPTIMIZERS)
+    for k, opt in enumerate(OPTIMIZERS):
         w, lr, loss = [], [], []
         for s in studies:
             fr = _fresh(df, s, opt)
@@ -1101,11 +1287,18 @@ def figure_5(df: pd.DataFrame, outdir: Path | str) -> Path:
             loss.append(fr["final_val_loss"].mean())
         if w:
             c = OPTIMIZER_COLORS[opt]
-            ax1.plot(w, lr, "o-", color=c, label=opt)
-            ax2.plot(w, loss, "o-", color=c, label=opt)
+            mk = OPTIMIZER_MARKERS[opt]
+            wd = [x * 2 ** (_FIG5_DODGE * (k - (n_opt - 1) / 2)) for x in w]
+            ax1.plot(wd, lr, "-", marker=mk, color=c, label=opt, ms=6,
+                     mfc="none", mew=1.4, alpha=0.9)
+            ax2.plot(wd, loss, "-", marker=mk, color=c, label=opt, ms=6,
+                     mfc="none", mew=1.4, alpha=0.9)
     for ax, yl in ((ax1, "optimal LR"), (ax2, "best final val loss")):
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("width (log2)")
+        ax.set_xticks(sorted(widths.values()))
+        ax.set_xticklabels([f"{v:g}" for v in sorted(widths.values())])
+        ax.minorticks_off()
+        ax.set_xlabel("width (log2; optimizers dodged horizontally)")
         ax.set_ylabel(yl)
     ax1.set_yscale("log")
     ax1.legend(fontsize=7)
@@ -1199,70 +1392,72 @@ def figure_7(df: pd.DataFrame, outdir: Path | str) -> Path:
 
 def figure_8(df: pd.DataFrame, outdir: Path | str,
              logs: pd.DataFrame | None = None) -> Path:
-    """Diagnostics: max attention logit over training (dense, MoE);
-    expert-share entropy over training (MoE); final spectral norms per layer
-    (PLAN Plots #8)."""
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 3.4))
-    have = logs is not None and not logs.empty
-    ev = logs[logs["t"] == "eval"] if have else pd.DataFrame()
+    """Diagnostics of the headline fresh-seed runs only (PLAN Plots #8):
+    (a) max attention logit over training, dense solid / MoE dashed, mean over
+    seeds; (b) expert-share entropy over training (MoE, H7), mean over seeds;
+    (c) final per-layer spectral norms, mean over seeds, log y, on its own
+    full-width row.  Smoke, tuning, budget-curve and other non-headline runs
+    are excluded, as are runs without a completed fresh-seed result in
+    ``df`` (``_fresh_logs``)."""
+    fig = plt.figure(figsize=(14, 7.2))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.15])
+    ax1, ax2 = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[1, :])
     # (a) max attention logit, dense + moe
-    drew = False
-    if have and "max_attn_logit" in ev.columns:
+    attn = attn_logit_curves(logs, df)
+    if not attn.empty:
         for study, ls in (("dense", "-"), ("moe", "--")):
-            g = ev[(ev["study"] == study) & ev["max_attn_logit"].notna()]
+            g = attn[attn["study"] == study]
             for opt in [o for o in OPTIMIZERS if o in set(g["optimizer"])]:
-                agg = g[g["optimizer"] == opt].groupby("images_or_tokens")[
-                    "max_attn_logit"].mean()
-                ax1.plot(agg.index, agg.values, ls, color=OPTIMIZER_COLORS[opt],
-                         label=f"{opt} ({study})" if study == "dense" else None)
-                drew = True
-    if drew:
+                go = g[g["optimizer"] == opt].sort_values("images_or_tokens")
+                ax1.plot(go["images_or_tokens"], go["max_attn_logit"], ls,
+                         color=OPTIMIZER_COLORS[opt],
+                         label=opt if study == "dense" or not (
+                             attn["study"] == "dense").any() else None)
         ax1.set_xlabel("tokens")
         ax1.set_ylabel("max attention logit")
         ax1.legend(fontsize=6)
-        ax1.set_title("dense (solid) / MoE (dashed)", fontsize=8)
+        ax1.set_title("fresh seeds (mean): dense solid / MoE dashed", fontsize=8)
     else:
-        _no_data(ax1, "no attention-logit logs")
+        _no_data(ax1, "no fresh-seed attention-logit logs")
     # (b) expert entropy, moe
-    drew = False
-    if have and "expert_entropy" in ev.columns:
-        g = ev[(ev["study"] == "moe") & ev["expert_entropy"].notna()]
-        for opt in [o for o in OPTIMIZERS if o in set(g["optimizer"])]:
-            agg = g[g["optimizer"] == opt].groupby("images_or_tokens")[
-                "expert_entropy"].mean()
-            ax2.plot(agg.index, agg.values, color=OPTIMIZER_COLORS[opt], label=opt)
-            drew = True
-    if drew:
+    ent = expert_entropy_curves(logs, df)
+    if not ent.empty:
+        for opt in [o for o in OPTIMIZERS if o in set(ent["optimizer"])]:
+            go = ent[ent["optimizer"] == opt].sort_values("images_or_tokens")
+            ax2.plot(go["images_or_tokens"], go["expert_entropy"],
+                     color=OPTIMIZER_COLORS[opt], label=opt)
         ax2.set_xlabel("tokens")
         ax2.set_ylabel("expert-share entropy")
         ax2.legend(fontsize=6)
-        ax2.set_title("MoE expert load (H7)", fontsize=8)
+        ax2.set_title("MoE expert load (H7), fresh seeds (mean)", fontsize=8)
     else:
-        _no_data(ax2, "no MoE entropy logs")
-    # (c) final spectral norms per layer
-    drew = False
-    if have:
-        fin = logs[(logs["t"] == "final") & logs.get(
-            "spectral_norms", pd.Series(dtype=object)).notna()]
-        if not fin.empty:
-            study = "dense" if (fin["study"] == "dense").any() else fin["study"].iloc[0]
-            fin = fin[fin["study"] == study]
-            opts = [o for o in OPTIMIZERS if o in set(fin["optimizer"])]
-            layers = sorted(fin.iloc[0]["spectral_norms"].keys())
-            w = 0.8 / max(len(opts), 1)
-            for k, opt in enumerate(opts):
-                sn = fin[fin["optimizer"] == opt].iloc[0]["spectral_norms"]
-                xs = [i + (k - len(opts) / 2) * w for i in range(len(layers))]
-                ax3.bar(xs, [sn.get(l, np.nan) for l in layers], width=w * 0.9,
-                        color=OPTIMIZER_COLORS[opt], label=opt)
-            ax3.set_xticks(range(len(layers)))
-            ax3.set_xticklabels(layers, rotation=45, ha="right", fontsize=6)
-            ax3.set_ylabel("final spectral norm")
-            ax3.set_title(f"{study}: per-layer sigma_max", fontsize=8)
-            ax3.legend(fontsize=6)
-            drew = True
-    if not drew:
-        _no_data(ax3, "no spectral-norm logs")
+        _no_data(ax2, "no fresh-seed MoE entropy logs")
+    # (c) final spectral norms per layer, mean over fresh seeds
+    study, sn = spectral_norm_means(logs, df=df)
+    if not sn.empty:
+        opts = list(sn.columns)
+        layers = list(sn.index)
+        w = 0.8 / max(len(opts), 1)
+        for k, opt in enumerate(opts):
+            xs = [i + (k - (len(opts) - 1) / 2) * w for i in range(len(layers))]
+            ax3.bar(xs, sn[opt].to_numpy(dtype=float), width=w * 0.95,
+                    color=OPTIMIZER_COLORS[opt], label=opt)
+        ax3.set_xticks(range(len(layers)))
+        ax3.set_xticklabels([short_layer_name(l) for l in layers],
+                            rotation=90, fontsize=7)
+        ax3.set_xlim(-0.6, len(layers) - 0.4)
+        ax3.set_yscale("log")
+        # bars start at the axis floor: keep it below the smallest value
+        # (Manifold Muon sits at ~1.0) so every bar is visible
+        vmin = float(np.nanmin(sn.to_numpy(dtype=float)))
+        ax3.set_ylim(bottom=vmin / 2)
+        ax3.set_ylabel("final spectral norm (log)")
+        ax3.set_title(f"{study}: per-layer sigma_max, mean over fresh seeds "
+                      "(AdamW logs none)", fontsize=8)
+        ax3.legend(fontsize=7, ncol=len(opts))
+    else:
+        _no_data(ax3, "no fresh-seed spectral-norm logs")
     fig.tight_layout()
     return _save(fig, outdir, "fig8_diagnostics.png")
 
