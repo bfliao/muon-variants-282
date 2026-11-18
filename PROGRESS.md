@@ -74,3 +74,4 @@ Scripts/outputs: session scratchpad (diag_manifold.py, ref_regime.py, diag/summa
 
 ## 2026-11-17 — Gate 4: 5 final seeds (Paul)
 _FINAL_SEED_COUNT = 5 (DAG-only; seeds 1-3 hashes unchanged). New jobs: 10 fresh-seed runs per study (seeds 4-5 x 5 optimizers) plus the AdamW budget curve for seeds 4-5 once those land. Launched: MLP chain (mlp128 -> mlp256 -> mlp512, one CIFAR process at a time) in parallel with dense. MoE still deferred. Loss vs accuracy note added to PLAN Decisions log.
+- REVISED (Paul): Gate 4 = keep 3 seeds. Seeds 4-5 runs stopped ~23:35; the 3 completed (mlp128 adamw s4/s5, muon s4) and partial logs moved to logs/diagnostics/discarded_seeds45/ (unused). _FINAL_SEED_COUNT back to 3.
