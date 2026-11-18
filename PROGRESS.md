@@ -49,3 +49,25 @@
 - Phase 3 smoke+timing (scripts/phase3.sh) running under caffeinate: all 5 studies, every optimizer, Manifold caps 5 and 10; then tables/compute_estimate.md.
 - Gate-3 prep: profiled Manifold Muon (per-matrix dual-ascent bookkeeping was 81-84% of the MoE optimizer step); vectorized it (DEVIATIONS #9, bit-identical, 76 new tests, review APPROVE; suite 393 passed); re-timed transformers per step (DEVIATIONS #10). MoE timings contaminated by a concurrent Zoom call (fwd+bwd varied 160-1130 ms for identical work): re-time on an idle machine before Gate 3.
 - MLP protocol change (DEVIATIONS #12): full Phase-I CD at MLP-256/512 (headline) + inherited Phase-II track (seed 0, H4); MLP-256 pilot added. studies.py + analysis.py track separation; review FIX NEEDED (analysis mixed tracks) -> fixed -> APPROVE. Suite 407 passed. MLP-128/dense/MoE job hashes unchanged vs pre-change snapshot. Pilots: mlp128 std 0.0053, dense std 0.0291. MLP-256/512 NOT started pending Paul confirmation.
+- 2026-11-17 ~13:40 PST: machine ran out of RAM with 4 runners (each MLP process holds the 5.3 GB CIFAR-5m train set, ~10 GB at load). All runners died; completed results intact (atomic writes). Relaunched 13:47 detached (nohup): ONE MLP process at a time (scripts/sweep_chain.sh mlp128 mlp256 mlp512) + dense in parallel.
+
+## 2026-11-17 21:46 PST — MLP + dense sweeps complete (Gate-3 item 4)
+All DAG phases complete for mlp128, mlp256, mlp512, dense (runner --status: 0 incomplete).
+Actual run time (sum of wall_clock_s, excl. smoke) vs estimate:
+- mlp128: 113 runs, 1.48 h (est 0.5 h)
+- mlp256: 186 runs, 2.57 h (est 1.7 h)
+- mlp512: 187 runs, 4.71 h (est 3.6 h)
+- dense: 108 runs, 9.36 h (est 7.1 h)
+Divergences: 5, all MuonAll at lr 0.08 (top of grid), wd 0.01 — mlp128 cd; mlp256 cd + stage_a; mlp512 cd + stage_a. None on dense.
+MoE still deferred. Next: Gate 4 (3 vs 5 final seeds; dense pilot std 0.029).
+
+## 2026-11-17 late — Manifold Muon audit (diagnostic only; nothing in results/ or the protocol changed)
+Question: is "Manifold Muon worse than AdamW" a bug/tuning artefact? Finding: no bug found; it is the Stiefel constraint in our regime.
+- Tuning: LR optimum interior at every size (MLP-128: 0.0031 best, 0.0016 -> 0.939, 0.0063 -> 0.919). Cap 0/5/100 give 0.929/0.916/0.914.
+- Implementation: weights stay on the manifold (final spectral norms 1.000); existing one-step tests match the vendored reference; harness replica of the seed-0 baseline reproduces 0.91558 exactly.
+- Reference-regime control (reference MLP 3072-128-64-10, no bias, batch 1024, 5 epochs, 50k CIFAR-5m images standing in for CIFAR-10, 1 seed, our ManifoldMuon with momentum 0 / cap 100): Manifold lr 0.1 test acc 59.7% vs best AdamW 58.0% -> reproduces the blog's direction. Muon lr 0.03: 60.5% test, 80.4% train.
+- MLP-128 seed-0 ablations (val loss; baseline 0.9156, Muon 0.7981): momentum 0 -> 1.0332; AdamW-group lr x4/x16/x64 -> 0.9004/0.8940/0.9049; AdamW-group wd 0 -> 0.9085; forward scale 0.35/2.8/8 -> 1.1911/0.9433/diverged.
+- Unconstrained Muon ends with spectral norms 2.6-2.9 (MLP-128) and 1.6-12.3 (dense); Muon + Stiefel init only (init ablation) = 0.827 vs 0.807.
+- Open protocol point for Paul: Manifold gains ~0.02 from a larger AdamW-group lr, which the frozen protocol pins to AdamW's tuned lr. Not changed.
+Scripts/outputs: session scratchpad (diag_manifold.py, ref_regime.py, diag/summary.jsonl) — not in the repo.
+- Follow-up (Paul): Muon with AdamW-group lr ×16 on MLP-128 seed 0 = 0.8058 (vs 0.7981) -> the classifier-lr sensitivity is Manifold-specific. Audit write-up in docs/manifold_audit.md; scripts moved to scripts/diag_manifold.py and scripts/diag_ref_regime.py; outputs in logs/diagnostics/manifold_audit/; DEVIATIONS #13. Fixed .gitignore (".claude" and "hardware-results.csv" had been merged onto one line).
