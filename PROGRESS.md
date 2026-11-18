@@ -75,3 +75,8 @@ Scripts/outputs: session scratchpad (diag_manifold.py, ref_regime.py, diag/summa
 ## 2026-11-17 — Gate 4: 5 final seeds (Paul)
 _FINAL_SEED_COUNT = 5 (DAG-only; seeds 1-3 hashes unchanged). New jobs: 10 fresh-seed runs per study (seeds 4-5 x 5 optimizers) plus the AdamW budget curve for seeds 4-5 once those land. Launched: MLP chain (mlp128 -> mlp256 -> mlp512, one CIFAR process at a time) in parallel with dense. MoE still deferred. Loss vs accuracy note added to PLAN Decisions log.
 - REVISED (Paul): Gate 4 = keep 3 seeds. Seeds 4-5 runs stopped ~23:35; the 3 completed (mlp128 adamw s4/s5, muon s4) and partial logs moved to logs/diagnostics/discarded_seeds45/ (unused). _FINAL_SEED_COUNT back to 3.
+
+## 2026-11-18 — Figures v2 (DEVIATIONS #14)
+- New figure set (docs/figures_spec.md): muonarch/figures.py + tests/test_figures.py; 21 figures in figures/ (PNG + PDF). Full suite 449 passed. Independent review of figures.py (numerical correctness) in progress at commit time.
+- Analysis fix 33c36be: H7 = insufficient data (was computed from MoE smoke runs); load_logs skips logs/diagnostics.
+- Open data points raised while plotting (not yet resolved): (1) dense AdamW seed-0 CD run at lr 0.004 is ~0.056 nats better than the accepted 0.001, rejected under the 0.058 threshold -> dense baseline may be under-tuned; supplementary check proposed to Paul. (2) MLP token speedups > 2x extrapolate the AdamW budget curve beyond its largest measured budget. (3) analysis._lr_sweep_rows may return a pre-acceptance CD sweep in four cases (affects the "LR basin" column and H6's basin part); under review.
