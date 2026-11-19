@@ -80,3 +80,11 @@ _FINAL_SEED_COUNT = 5 (DAG-only; seeds 1-3 hashes unchanged). New jobs: 10 fresh
 - New figure set (docs/figures_spec.md): muonarch/figures.py + tests/test_figures.py; 21 figures in figures/ (PNG + PDF). Full suite 449 passed. Independent review of figures.py (numerical correctness) in progress at commit time.
 - Analysis fix 33c36be: H7 = insufficient data (was computed from MoE smoke runs); load_logs skips logs/diagnostics.
 - Open data points raised while plotting (not yet resolved): (1) dense AdamW seed-0 CD run at lr 0.004 is ~0.056 nats better than the accepted 0.001, rejected under the 0.058 threshold -> dense baseline may be under-tuned; supplementary check proposed to Paul. (2) MLP token speedups > 2x extrapolate the AdamW budget curve beyond its largest measured budget. (3) analysis._lr_sweep_rows may return a pre-acceptance CD sweep in four cases (affects the "LR basin" column and H6's basin part); under review.
+
+## 2026-11-19 — LR-sweep fix and extrapolation flags (reviewed: APPROVE)
+- analysis._lr_sweep_rows now uses the coordinate-descent pass around the accepted config (was an earlier pass in 5 cells). Table changes: LR basin mlp512 moonlight and muonall 1.00 -> 0.00; H6 text corrected, verdict unchanged (falsified).
+- New analysis.speedup_extrapolation: speedups beyond AdamW's largest measured budget (2x) carry a dagger in tables/main.md and hollow markers in F2 (mlp128 muon partly and muonall; mlp256/512 muon, moonlight, muonall; none on dense).
+- A1/F5 show MuonAll's lr 0.08 divergence from the earlier tuning pass. Full suite: 469 passed.
+- Reviewer notes left open (not wrong on current data): no warning if fresh seeds disagree on a non-LR hyper or if the fallback context is used; F2 legend wording for the partly-extrapolated mlp128 Muon; hollow markers slightly larger than filled.
+- Results and per-run logs are now tracked in git (6ffe0c1). FineWeb tokens published: https://huggingface.co/datasets/Paulopasso/fineweb-edu-bpe4096-45m (verified byte-identical on anonymous download). README added (ab3a12f).
+- Still open for Paul: dense AdamW baseline check (lr 0.002/0.004, seeds 1-3); MoE compute plan.
