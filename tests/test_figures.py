@@ -30,7 +30,7 @@ import pytest
 
 from muonarch import analysis as an
 from muonarch import figures as fg
-from tests.test_analysis import D1, OPT_RATE, PLANTED, make_world
+from tests.test_analysis import D1, OPT_RATE, PLANTED, _beyond_budget, make_world
 
 # ---------------------------------------------------------------- fixtures
 
@@ -682,3 +682,192 @@ def test_main_writes_into_the_given_outdir(world, tmp_path, capsys):
     # the synthetic world itself is untouched
     assert not (world / "figures").exists()
     assert np.all([l.split(":")[0] in _fig_ids(an.load_results(world)) for l in printed])
+
+
+# ---------------------------------------------------------------- review fixes
+
+def test_lr_sweep_is_a_view_of_the_analysis_sweep():
+    # ONE implementation: figures.lr_sweep == analysis._lr_sweep_rows
+    d = _frame(_two_pass_cd())
+    rows = an._lr_sweep_rows(d, "mlp256", "muon")
+    sw = fg.lr_sweep(d, "mlp256", "muon")
+    assert sorted(sw["lr"]) == sorted(rows["lr"])
+    ok = rows[rows["status"] == "completed"]
+    assert sorted(sw["loss"].dropna()) == pytest.approx(sorted(ok["final_val_loss"]))
+    assert set(np.round(rows["wd"], 12)) == {0.03}             # accepted context
+
+
+def test_lr_sweep_when_the_accepted_centre_beats_every_lr_labelled_row():
+    # the centre (lr 0.01, wd 0.03) carries the label "wd" and is the best
+    # cell; the best lr-LABELLED cell is in pass 1 (wd 0.01)
+    rows = []
+    for lr, loss in ((0.005, 0.80), (0.01, 0.700), (0.02, 0.705), (0.04, 0.90)):
+        rows.append(_row("mlp512", "moonlight", "cd", 0, lr, loss, wd=0.01,
+                         cd_sweep="lr"))
+    rows.append(_row("mlp512", "moonlight", "cd", 0, 0.01, 0.65, wd=0.03,
+                     cd_sweep="wd"))
+    for lr, loss in ((0.005, 0.78), (0.02, 0.72), (0.04, 0.85)):
+        rows.append(_row("mlp512", "moonlight", "cd", 0, lr, loss, wd=0.03,
+                         cd_sweep="lr"))
+    rows.append(_row("mlp512", "moonlight", "cd", 0, 0.08, None, wd=0.01,
+                     cd_sweep="lr", status="diverged"))        # pass-1 divergence
+    for seed in (1, 2, 3):
+        rows.append(_row("mlp512", "moonlight", "fresh_seed", seed, 0.01, 0.65,
+                         wd=0.03))
+    d = _frame(rows)
+    sw = fg.lr_sweep(d, "mlp512", "moonlight")
+    assert list(sw["lr"]) == [0.005, 0.01, 0.02, 0.04]
+    assert list(sw["loss"]) == pytest.approx([0.78, 0.65, 0.72, 0.85])
+    assert an.lr_basin_width("mlp512", "moonlight", d, 0.01) == 0.0
+    # the pass-1 divergence is not on the curve but is reported for the x mark
+    assert fg.earlier_pass_divergences(d, "mlp512", "moonlight") == [0.08]
+
+
+def test_earlier_pass_divergences_exclude_the_shown_sweep():
+    rows = _two_pass_cd(inherited=False)        # diverged lr 0.08 IN the final sweep
+    d = _frame(rows)
+    assert fg.earlier_pass_divergences(d, "mlp256", "muon") == []
+    rows.append(_row("mlp256", "muon", "cd", 0, 0.16, None, wd=0.01, cd_sweep="lr",
+                     status="diverged"))
+    assert fg.earlier_pass_divergences(_frame(rows), "mlp256", "muon") == [0.16]
+    assert fg.earlier_pass_divergences(_frame(rows), "mlp256", "adamw") == []
+
+
+def test_speedup_centre_is_the_geometric_mean(df, monkeypatch):
+    mat = [[1.0, 2.0, 4.0], [1.0, 2.0, 4.0], [1.0, 2.0, 16.0]]
+    fake = pd.DataFrame({"speedup_min": [1.0], "speedup_max": [16.0],
+                         "matrix": [mat]}, index=["muon"])
+    monkeypatch.setattr(an, "token_speedup_range", lambda study, d: fake)
+    r = fg.speedup_summary(df, "dense", "tokens").set_index("optimizer").loc["muon"]
+    flat = np.array(mat).ravel()
+    geo = float(np.exp(np.log(flat).mean()))
+    assert r["mid"] == pytest.approx(geo)
+    assert r["mid"] != pytest.approx(flat.mean(), rel=0.05)     # not the arithmetic mean
+    assert r["mid"] != pytest.approx(float(np.median(flat)), rel=0.05)
+    assert (r["lo"], r["hi"]) == (1.0, 16.0)
+    assert (r["n_curve"], r["n_run"]) == (3, 3)
+    # an inf cell (below the fitted asymptote) is counted, not averaged
+    mat2 = [[2.0, 8.0, math.inf]]
+    fake2 = pd.DataFrame({"speedup_min": [2.0], "speedup_max": [math.inf],
+                          "matrix": [mat2]}, index=["muon"])
+    monkeypatch.setattr(an, "token_speedup_range", lambda study, d: fake2)
+    r2 = fg.speedup_summary(df, "dense", "tokens").iloc[0]
+    assert r2["mid"] == pytest.approx(4.0) and r2["n_inf"] == 1
+    assert (r2["n_curve"], r2["n_run"]) == (1, 3)
+
+
+def test_speedup_summary_flags_extrapolation_from_the_data(df):
+    tok = fg.speedup_summary(df, "dense", "tokens").set_index("optimizer")
+    assert (tok["max_budget"] == 2.0).all() and not tok["extrapolated"].any()
+    d1 = _beyond_budget(df)       # Muon beats AdamW's best 2x run
+    t1 = fg.speedup_summary(d1, "dense", "tokens").set_index("optimizer")
+    assert (t1["max_budget"] == 2.0).all()
+    assert bool(t1.loc["muon", "extrapolated"])
+    assert not bool(t1.loc["manifold", "extrapolated"])
+    fl = fg.speedup_summary(d1, "dense", "flops").set_index("optimizer")
+    assert bool(fl.loc["muon", "extrapolated"])    # same equivalent data
+
+
+def test_f6_star_is_the_accepted_value_not_the_best_cd_loss():
+    rows = _two_pass_cd(inherited=False)
+    # a cd cell that BEATS the accepted one (lr 0.04 at the accepted wd)
+    for r in rows:
+        if r["phase"] == "cd" and r["lr"] == 0.04 and r["wd"] == 0.03:
+            r["final_val_loss"] = 0.55
+    d = _frame(rows)
+    sl = fg.cd_slices(d, "mlp256", "muon")
+    fin = sl[(sl["hyper"] == "lr") & sl["final"]]
+    assert fin.loc[fin["loss"].idxmin(), "value"] == 0.04       # the best cd loss
+    assert list(fin[fin["accepted"]]["value"]) == [0.02]        # the star
+    assert fg.accepted_config(d, "mlp256", "muon")["lr"] == 0.02
+    # delta is against the optimizer's best completed cd loss (0.55), in
+    # every slice — not against each slice's own minimum
+    ok = sl[sl["status"] == "completed"]
+    assert (ok["delta"] - (ok["loss"] - 0.55)).abs().max() < 1e-12
+    assert fin[fin["accepted"]]["delta"].iloc[0] == pytest.approx(0.05)
+    mo = sl[sl["hyper"] == "momentum"]
+    assert mo["delta"].min() == pytest.approx(0.05)             # slice min 0.60
+    wd = sl[sl["hyper"] == "wd"]
+    assert sorted(wd["delta"]) == pytest.approx([0.10, 0.15, 0.17])
+
+
+def test_faithful_and_halflr_rows_pair_with_the_same_seed():
+    rows = _two_pass_cd(inherited=False)        # fresh: seed 1 .61, 2 .60, 3 .62
+    rows.append(_row("mlp256", "muon", "faithful", 3, 0.02, 0.70, wd=0.03))
+    rows.append(_row("mlp256", "muon", "faithful", 7, 0.02, 0.71, wd=0.03))  # no pair
+    for seed, loss in ((1, 0.50), (2, 0.51), (3, 0.52)):
+        rows.append(_row("mlp256", "adamw", "budget_constant", seed, 0.001, loss,
+                         mult=2.0))
+    rows.append(_row("mlp256", "adamw", "budget_halflr", 2, 0.0005, 0.53, mult=2.0))
+    rows.append(_row("mlp256", "adamw", "budget_halflr", 9, 0.0005, 0.54, mult=2.0))
+    d = _frame(rows)
+    fa = fg.faithful_pairs(d)
+    assert list(fa["seed"]) == [3]                              # seed 7: no partner
+    assert fa.iloc[0]["standard"] == pytest.approx(0.62)        # seed 3, not seed 1
+    assert fa.iloc[0]["faithful"] == pytest.approx(0.70)
+    hl = fg.halflr_pairs(d)
+    assert list(hl["seed"]) == [2]
+    assert (hl.iloc[0]["full_lr"], hl.iloc[0]["half_lr"]) == (0.51, 0.53)
+
+
+def test_attn_logit_bands_exclude_runs_without_a_completed_result(df, logs):
+    full = fg.attn_logit_bands(logs, df, "dense")
+    assert set(full["n_seeds"]) == {3}
+    fresh = an._fresh(df, "dense", "muon").sort_values("seed")
+    victim = fresh.iloc[0]
+    for status in ("stopped", "diverged"):
+        d2 = df.copy()
+        d2.loc[d2["hash"] == victim["hash"], "status"] = status
+        at = fg.attn_logit_bands(logs, d2, "dense")
+        assert set(at[at["optimizer"] == "muon"]["n_seeds"]) == {2}
+        assert set(at[at["optimizer"] == "adamw"]["n_seeds"]) == {3}
+    # the result JSON missing altogether: its log is still on disk
+    d3 = df[df["hash"] != victim["hash"]]
+    at3 = fg.attn_logit_bands(logs, d3, "dense")
+    assert set(at3[at3["optimizer"] == "muon"]["n_seeds"]) == {2}
+    ev = logs[(logs["t"] == "eval") & (logs["hash"].isin(set(fresh["hash"]) -
+                                                         {victim["hash"]}))]
+    last = at3[at3["optimizer"] == "muon"].sort_values("x").iloc[-1]
+    kept = ev[ev["images_or_tokens"] == last["x"]]["max_attn_logit"]
+    assert last["mean"] == pytest.approx(kept.mean())
+
+
+def test_seed_counts_come_from_the_data(df):
+    assert fg.seed_counts(df, "dense") == {o: 3 for o in fg.OPT_ORDER}
+    victim = an._fresh(df, "dense", "muon").iloc[0]["hash"]
+    d2 = df[df["hash"] != victim]
+    assert fg.seed_counts(d2, "dense")["muon"] == 2
+    fg._NOTES.clear()
+    assert fg.seeds_text("fx", {"a": 3, "b": 3}) == "3"
+    assert fg._NOTES == []
+    assert fg.seeds_text("fx", {"dense/adamw": 3, "dense/muon": 2}) == "2–3"
+    assert len(fg._NOTES) == 1 and "dense/muon (2)" in fg._NOTES[0]
+    assert "dense/adamw" not in fg._NOTES[0]
+    fg._NOTES.clear()
+
+
+def test_uneven_seed_counts_reach_the_legend_and_stdout(df, logs, tmp_path):
+    victim = an._fresh(df, "dense", "muon").iloc[0]["hash"]
+    d2 = df[df["hash"] != victim]
+    out = io.StringIO()
+    fg.build_all(d2, logs, tmp_path, out=out)
+    lines = {l.split(":")[0]: l for l in out.getvalue().splitlines()}
+    assert "seed counts differ" in lines["f1_final_loss"]
+    assert "dense/muon (2)" in lines["f1_final_loss"]
+    out3 = io.StringIO()
+    fg.build_all(df, logs, tmp_path, out=out3)
+    assert "seed counts differ" not in out3.getvalue()
+    # the legend text itself is computed, not hard-coded
+    with fg.style():
+        pass
+    fig_texts = []
+    orig = fg._save
+    try:
+        def spy(fig, outdir, stem):
+            fig_texts.extend(t.get_text() for lg in fig.legends for t in lg.get_texts())
+            return orig(fig, outdir, stem)
+        fg._save = spy
+        fg.fig_f1(d2, logs, tmp_path)
+    finally:
+        fg._save = orig
+    assert any("mean of 2–3 seeds" in t for t in fig_texts)

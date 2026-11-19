@@ -17,9 +17,8 @@ Conventions that go beyond the spec text (all stated on the figures):
 
 * The "accepted" hyperparameters of an optimizer are the ones its fresh-seed
   (headline) runs used.  The learning-rate sweep shown for an optimizer is the
-  coordinate-descent slice at exactly those accepted values
-  (``lr_sweep``) — not ``analysis._lr_sweep_rows``, whose context is chosen by
-  the best lr-labelled cell and can be a first-pass (pre-acceptance) slice.
+  coordinate-descent slice at exactly those accepted values: ``lr_sweep`` is a
+  thin view of ``analysis._lr_sweep_rows`` (the one implementation).
 * The central speedup value is the geometric mean of the 3x3
   {AdamW curve seed} x {optimizer seed} matrix; the whisker is its min-max.
 """
@@ -420,16 +419,15 @@ def cd_slices(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
 def lr_sweep(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
     """The headline learning-rate sweep (seed 0): lr, loss, status.
 
-    Where the study ran a coordinate descent this is the cd slice at the
-    ACCEPTED values of every other hyperparameter (so it contains the accepted
-    centre, whatever ``cd_sweep`` label dedup left on it).  Otherwise it falls
-    back to ``analysis._lr_sweep_rows(track="headline")``.  The inherited
-    track never enters for a cd-tuned study."""
-    sl = cd_slices(df, study, opt)
-    sl = sl[(sl["hyper"] == "lr") & sl["final"]]
-    if not sl.empty:
-        return (sl[["value", "loss", "status"]].rename(columns={"value": "lr"})
-                .sort_values("lr").reset_index(drop=True))
+    A thin view of ``analysis._lr_sweep_rows(track="headline")`` — the ONE
+    implementation of "which rows form the lr sweep": the coordinate-descent
+    cells at the ACCEPTED values of every other hyperparameter (so it holds
+    the accepted centre, whatever ``cd_sweep`` label dedup left on it), or the
+    Stage-A grid for a study without a coordinate descent.  The inherited
+    track never enters for a cd-tuned study.  Diverged cells are kept."""
+    cols = ["lr", "loss", "status"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
     rows = an._lr_sweep_rows(df, study, opt, "headline")
     rows = rows[rows["status"].isin(["completed", "diverged"])]
     recs = {}
@@ -443,8 +441,54 @@ def lr_sweep(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
         if cur is None or cur[1] == "diverged" or (ok and loss < cur[0]):
             recs[lr] = (loss, "completed" if ok else "diverged")
     return pd.DataFrame([{"lr": k, "loss": v[0], "status": v[1]}
-                         for k, v in sorted(recs.items())],
-                        columns=["lr", "loss", "status"])
+                         for k, v in sorted(recs.items())], columns=cols)
+
+
+def earlier_pass_divergences(df: pd.DataFrame, study: str, opt: str) -> list[float]:
+    """Learning rates at which a coordinate-descent run of (study, optimizer)
+    DIVERGED in a pass other than the accepted-context sweep (``lr_sweep``),
+    i.e. with other hyperparameters at pre-acceptance values.  They are not on
+    the headline curve, but they bound the stable range and must be shown."""
+    if df is None or df.empty:
+        return []
+    r = df[(df["study"] == study) & (df["optimizer"] == opt) & (df["phase"] == "cd")
+           & (df["status"] == "diverged")]
+    if r.empty:
+        return []
+    sw = lr_sweep(df, study, opt)
+    shown = set(sw[sw["status"] == "diverged"]["lr"])
+    return sorted({v for v in (_num(x) for x in r["lr"]) if v is not None} - shown)
+
+
+def seed_counts(df: pd.DataFrame, study: str) -> dict[str, int]:
+    """Completed fresh-seed runs per optimizer of a study (house order)."""
+    return {o: int(len(an._fresh(df, study, o))) for o in present_optimizers(df, study)}
+
+
+def seeds_text(fig_id: str, counts: dict) -> str:
+    """The seed count to print in a legend, computed from the data: "3" when
+    every group has 3, "2–3" otherwise — and in that case a stdout note names
+    the groups with fewer seeds than the others."""
+    vals = sorted({int(v) for v in counts.values()})
+    if not vals:
+        return "0"
+    if len(vals) == 1:
+        return str(vals[0])
+    short = ", ".join(f"{k} ({int(v)})" for k, v in counts.items() if int(v) < vals[-1])
+    _note(f"{fig_id}: seed counts differ — fewer than {vals[-1]} seeds for: {short}")
+    return f"{vals[0]}–{vals[-1]}"
+
+
+def spectral_seed_counts(logs: pd.DataFrame | None, df: pd.DataFrame,
+                         study: str = "dense") -> dict[str, int]:
+    """Fresh seeds with logged final spectral norms, per optimizer."""
+    fin = an._fresh_logs(logs, "final", df)
+    if fin.empty or "spectral_norms" not in fin.columns:
+        return {}
+    fin = fin[(fin["study"] == study)
+              & fin["spectral_norms"].apply(lambda d: isinstance(d, dict) and len(d) > 0)]
+    return {o: int(fin[fin["optimizer"] == o]["seed"].nunique())
+            for o in OPT_ORDER if o in set(fin["optimizer"])}
 
 
 def noise_threshold(df: pd.DataFrame, study: str) -> float:
@@ -464,18 +508,25 @@ def noise_threshold(df: pd.DataFrame, study: str) -> float:
 
 def speedup_summary(df: pd.DataFrame, study: str, kind: str = "tokens") -> pd.DataFrame:
     """Speedup over AdamW per optimizer: lo, hi (min-max of the curve-seed x
-    run-seed matrix), mid (geometric mean of its finite cells), n_inf.
-    ``kind``: "tokens" or "flops".  Empty without budget-curve runs."""
-    cols = ["optimizer", "lo", "hi", "mid", "n_inf"]
+    run-seed matrix), mid (geometric mean of its finite cells), n_inf,
+    n_curve / n_run (the matrix shape: AdamW curve seeds x optimizer seeds),
+    extrapolated (some cell lies beyond the largest measured AdamW budget,
+    ``analysis.speedup_extrapolation``) and max_budget (that budget, as a
+    multiple of 1x).  ``kind``: "tokens" or "flops".  Empty without
+    budget-curve runs."""
+    cols = ["optimizer", "lo", "hi", "mid", "n_inf", "n_curve", "n_run",
+            "extrapolated", "max_budget"]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             fr = (an.token_speedup_range(study, df) if kind == "tokens"
                   else an.flop_speedup_range(study, df))
+            ext = an.speedup_extrapolation(study, df)
         except (ValueError, KeyError, IndexError):
             return pd.DataFrame(columns=cols)
     recs = []
     for opt in [o for o in OPT_ORDER if o in fr.index]:
+        shape = np.asarray(fr.loc[opt, "matrix"], dtype=float).shape
         mat = np.asarray(fr.loc[opt, "matrix"], dtype=float).ravel()
         fin = mat[np.isfinite(mat) & (mat > 0)]
         recs.append({
@@ -484,6 +535,10 @@ def speedup_summary(df: pd.DataFrame, study: str, kind: str = "tokens") -> pd.Da
             "hi": float(mat.max()) if mat.size else math.nan,
             "mid": float(np.exp(np.log(fin).mean())) if fin.size else math.inf,
             "n_inf": int(mat.size - fin.size),
+            "n_curve": int(shape[0]), "n_run": int(shape[1]),
+            "extrapolated": bool(opt in ext.index and ext.loc[opt, "extrapolated"]),
+            "max_budget": float(ext.loc[opt, "max_budget"]) if opt in ext.index
+            else math.nan,
         })
     return pd.DataFrame(recs, columns=cols)
 
@@ -958,9 +1013,11 @@ def fig_f1(df, logs, outdir) -> list[Path]:
             ax.xaxis.set_major_locator(MaxNLocator(3, min_n_ticks=3))
             _study_title(ax, study)
         fig.supxlabel("Final validation loss (lower is better)", fontsize=9)
+        n_txt = seeds_text("f1_final_loss", {f"{s}/{o}": n for s in studies
+                                             for o, n in seed_counts(df, s).items()})
         handles = [
             Line2D([], [], marker="o", color=PALE, ms=7.5, linestyle="none",
-                   label="mean of 3 seeds (value at right)"),
+                   label=f"mean of {n_txt} seeds (value at right)"),
             Line2D([], [], marker="o", color=PALE, ms=3.4, mec="white", mew=0.5,
                    linestyle="none", label="one seed (row below the mean)"),
             Line2D([], [], color=INK2, lw=0.8, label="AdamW mean"),
@@ -984,6 +1041,7 @@ def fig_f2(df, logs, outdir) -> list[Path]:
     with style():
         fig, axes = _subplots(2, len(studies), (FULL_W, 3.9), sharey=True)
         any_inf = False
+        extrap_budgets: set[float] = set()
         for i, (kind, rowlab) in enumerate(kinds):
             vals = []
             for s in studies:
@@ -1025,8 +1083,13 @@ def fig_f2(df, logs, outdir) -> list[Path]:
                                 solid_capstyle="butt", zorder=2)
                         ax.plot([r["lo"], hi], [y, y], "|", color=c, mec=c, ms=6, mew=1.4,
                                 zorder=2)
-                    ax.plot([r["mid"]], [y], marker=OPT_MARKER[opt], color=c,
-                            linestyle="none", zorder=3)
+                    if r["extrapolated"]:
+                        extrap_budgets.add(float(r["max_budget"]))
+                        ax.plot([r["mid"]], [y], marker=OPT_MARKER[opt], mfc="white",
+                                mec=c, mew=1.6, ms=6.5, linestyle="none", zorder=3)
+                    else:
+                        ax.plot([r["mid"]], [y], marker=OPT_MARKER[opt], color=c,
+                                linestyle="none", zorder=3)
                     if np.isfinite(hi):
                         ax.annotate(fmt_mult(r["mid"]), (end, y), xytext=(5, 0),
                                     textcoords="offset points", va="center",
@@ -1040,16 +1103,30 @@ def fig_f2(df, logs, outdir) -> list[Path]:
                     ax.set_ylabel(rowlab, fontsize=9, fontweight="bold")
         fig.supxlabel("Speedup over AdamW (×, log scale): AdamW data or FLOPs to reach "
                       "the same loss ÷ the optimizer's own", fontsize=9)
+        tok = {s: data[("tokens", s)] for s in studies}
+        n_curve = seeds_text("f2_speedup (AdamW curve seeds)",
+                             {s: int(d["n_curve"].max()) for s, d in tok.items()})
+        n_run = seeds_text("f2_speedup (run seeds)",
+                           {f"{s}/{o}": int(n) for s, d in tok.items()
+                            for o, n in zip(d["optimizer"], d["n_run"])})
         handles = [
             Line2D([], [], marker="o", color=PALE, lw=1.6, ms=6.5,
-                   label="geometric mean, min–max over 3 curve seeds × 3 run seeds"),
+                   label=f"geometric mean, min–max over {n_curve} curve seeds × "
+                         f"{n_run} run seeds"),
             Line2D([], [], color=INK2, lw=0.8, label="AdamW (= 1)"),
             Patch(facecolor=SHADE, edgecolor=GRID, label="slower than AdamW"),
         ]
+        if extrap_budgets:
+            b = sorted(extrap_budgets)
+            b_s = f"{b[0]:g}×" if len(b) == 1 else f"{b[0]:g}×–{b[-1]:g}×"
+            handles.append(Line2D([], [], marker="o", mfc="white", mec=PALE, mew=1.6,
+                                  ms=6.5, linestyle="none",
+                                  label=f"extrapolated beyond the largest AdamW budget "
+                                        f"({b_s})"))
         if any_inf:
             handles.append(Line2D([], [], color=PALE, lw=1.4, marker=">", ms=4,
                                   label="∞: below AdamW's fitted asymptote"))
-        _legend(fig, handles, ncol=len(handles))
+        _legend(fig, handles, ncol=2 if len(handles) > 3 else len(handles))
         return _save(fig, outdir, "f2_speedup")
 
 
@@ -1119,9 +1196,11 @@ def fig_f3(df, logs, outdir) -> list[Path]:
                    if any(o in present_optimizers(df, s) for s in studies)]
         for h in handles:
             h.set_label(h.get_label() + " at 1×")
+        n_txt = seeds_text("f3_budget_curve (AdamW curve seeds)",
+                           {s: len(budget_fits(df, s)) for s in studies})
         handles += [
             Line2D([], [], marker="o", color=PALE, ms=4.2, mec="white", mew=0.6,
-                   linestyle="none", label="AdamW run (3 seeds per budget)"),
+                   linestyle="none", label=f"AdamW run ({n_txt} seeds per budget)"),
             Line2D([], [], color=OPT_COLOR["adamw"], lw=1.0, ls=(0, (4, 2)),
                    label="fit L(D) = αD$^{-β}$ + γ, one per AdamW seed"),
         ]
@@ -1145,9 +1224,11 @@ def _curve_figure(df, logs, outdir, stem: str, xkind: str) -> list[Path]:
         return _skip(stem, "no fresh-seed eval logs")
     with style():
         fig, axes = _subplots(2, len(studies), (FULL_W, 4.3))
-        used = []
+        used, n_by = [], {}
         for j, study in enumerate(studies):
             cur = loss_curves(df, logs, study, xkind)
+            for o, g in cur.groupby("optimizer"):
+                n_by[f"{study}/{o}"] = int(g["n_seeds"].min())
             unit = "images" if study.startswith("mlp") else "tokens"
             opts = [o for o in OPT_ORDER if o in set(cur["optimizer"])]
             used += [o for o in opts if o not in used]
@@ -1216,7 +1297,8 @@ def _curve_figure(df, logs, outdir, stem: str, xkind: str) -> list[Path]:
             fig.supxlabel("Cumulative training FLOPs (log scale)", fontsize=9)
         handles = [_opt_handle(o) for o in used]
         handles.append(Patch(facecolor=PALE, alpha=0.35, lw=0,
-                             label="min–max over 3 seeds (line: mean)"))
+                             label=f"min–max over {seeds_text(stem, n_by)} seeds "
+                                   f"(line: mean)"))
         _legend(fig, handles, ncol=len(handles))
         return _save(fig, outdir, stem)
 
@@ -1249,10 +1331,11 @@ def fig_f5(df, logs, outdir) -> list[Path]:
     clip = 0.15
     with style():
         fig, axes = _subplots(2, len(opts), (FULL_W, 4.0), sharex="col")
-        any_div = any_raw = False
+        any_div = any_raw = any_early = False
         for j, opt in enumerate(opts):
             a0, a1 = axes[0][j], axes[1][j]
             all_lrs, sel, tops = [], {}, []
+            early: set[float] = set()
             for study, w in widths:
                 sw = lr_sweep(df, study, opt)
                 if sw.empty:
@@ -1260,6 +1343,7 @@ def fig_f5(df, logs, outdir) -> list[Path]:
                 c = WIDTH_COLOR.get(w, INK2)
                 ok = sw[sw["status"] == "completed"]
                 all_lrs += list(sw["lr"])
+                early |= set(earlier_pass_divergences(df, study, opt))
                 if ok.empty:
                     continue
                 lmin = float(ok["loss"].min())
@@ -1287,7 +1371,13 @@ def fig_f5(df, logs, outdir) -> list[Path]:
                         ax.plot([lr], [0.965], "x", color=INK, mec=INK, ms=6, mew=1.5,
                                 transform=ax.get_xaxis_transform(), zorder=6,
                                 clip_on=False)
-            _log_lr_axis(a1, all_lrs)
+            for lr in sorted(early):
+                any_early = True
+                for ax in (a0, a1):
+                    ax.plot([lr], [0.965], "x", color=INK2, mec=INK2, ms=5, mew=1.0,
+                            transform=ax.get_xaxis_transform(), zorder=6,
+                            clip_on=False)
+            _log_lr_axis(a1, all_lrs + sorted(early))
             a0.set_title(OPT_LABEL[opt])
             a1.set_ylim(-0.03, clip)
             a0.yaxis.set_major_locator(MaxNLocator(4))
@@ -1324,7 +1414,12 @@ def fig_f5(df, logs, outdir) -> list[Path]:
         if any_div:
             handles.append(Line2D([], [], marker="x", color=INK, mec=INK, ms=6, mew=1.5,
                                   linestyle="none", label="diverged"))
-        _legend(fig, handles, ncol=len(handles), columnspacing=1.1)
+        if any_early:
+            handles.append(Line2D([], [], marker="x", color=INK2, mec=INK2, ms=5,
+                                  mew=1.0, linestyle="none",
+                                  label="diverged in an earlier tuning pass"))
+        _legend(fig, handles, ncol=3 if len(handles) > 5 else len(handles),
+                columnspacing=1.1)
         return _save(fig, outdir, "f5_width_transfer")
 
 
@@ -1600,20 +1695,27 @@ def fig_f8(df, logs, outdir) -> list[Path]:
         ax.set_ylabel("Rank by mean final validation loss")
         ax.grid(axis="x", visible=False)
         ax.spines["bottom"].set_bounds(0, len(studies) - 1)
+        n_txt = seeds_text("f8_rank_summary", {f"{s}/{o}": n for s in studies
+                                               for o, n in seed_counts(df, s).items()})
         handles = [Line2D([], [], marker="o", color=PALE, ms=9.5, linestyle="none",
-                          label="gap to the next-better optimizer passes the "
-                                "3-seed rule")]
+                          label=f"gap to the next-better optimizer passes the "
+                                f"{n_txt}-seed rule")]
         if any_hollow:
             handles.append(Line2D([], [], marker="o", mfc="white", mec=PALE, mew=1.8,
                                   ms=8.5, linestyle="none",
                                   label="not separated from the next-better optimizer "
-                                        "(3-seed heuristic, not a test)"))
+                                        f"({n_txt}-seed heuristic, not a test)"))
         _legend(fig, handles, ncol=1)
         return _save(fig, outdir, "f8_rank_summary")
 
 
 # ===========================================================================
 # Appendix figures
+
+#: y clip of A1 (loss minus sweep minimum, nats): keeps the near-optimum
+#: region readable; points above it are drawn as ^ at the top edge.
+A1_CLIP = 0.3
+
 
 def fig_a1(df, logs, outdir) -> list[Path]:
     """A1 — loss vs learning rate for all optimizers (relative and raw LR)."""
@@ -1622,11 +1724,12 @@ def fig_a1(df, logs, outdir) -> list[Path]:
     if not studies:
         return _skip("a1_lr_sensitivity", "no learning-rate sweeps")
     with style():
-        fig, axes = _subplots(2, len(studies), (FULL_W, 4.4))
-        used, any_div = [], False
+        fig, axes = _subplots(2, len(studies), (FULL_W, 4.5))
+        used = []
+        flags = dict(div=False, early=False, over=False)
         for j, study in enumerate(studies):
             a0, a1 = axes[0][j], axes[1][j]
-            rel_all, raw_all, near = [], [], []
+            rel_all, raw_all, near, curves = [], [], [], []
             for opt in OPT_ORDER:
                 sw = lr_sweep(df, study, opt)
                 best_lr = an._best_lr(df, study, opt)
@@ -1635,21 +1738,37 @@ def fig_a1(df, logs, outdir) -> list[Path]:
                     continue
                 if opt not in used:
                     used.append(opt)
-                c, mk = OPT_COLOR[opt], OPT_MARKER[opt]
-                d = ok["loss"] - float(ok["loss"].min())
-                rel = ok["lr"] / best_lr
-                a0.plot(rel, d, "-", color=c, marker=mk, ms=5, mew=0.7, zorder=3)
-                a1.plot(ok["lr"], d, "-", color=c, marker=mk, ms=5, mew=0.7, zorder=3)
-                rel_all += list(sw["lr"] / best_lr)
-                raw_all += list(sw["lr"])
+                d = (ok["loss"] - float(ok["loss"].min())).to_numpy()
+                lrs = ok["lr"].to_numpy(dtype=float)
+                rel = lrs / best_lr
+                early = earlier_pass_divergences(df, study, opt)
+                div = list(sw[sw["status"] == "diverged"]["lr"])
+                curves.append((opt, lrs, d, best_lr, div, early))
+                rel_all += list(sw["lr"] / best_lr) + [v / best_lr for v in early]
+                raw_all += list(sw["lr"]) + early
                 near += list(d[(rel >= 1 / 4.01) & (rel <= 4.01)])
-                for lr in sw[sw["status"] == "diverged"]["lr"]:
-                    any_div = True
-                    a0.plot([lr / best_lr], [0.96], "x", color=c, mec=c, ms=6, mew=1.5,
-                            transform=a0.get_xaxis_transform(), zorder=6)
-                    a1.plot([lr], [0.96], "x", color=c, mec=c, ms=6, mew=1.5,
-                            transform=a1.get_xaxis_transform(), zorder=6)
-            ytop = max(near + [1e-6]) * 1.2
+            ytop = min(max(near + [1e-6]) * 1.2, A1_CLIP)
+            for opt, lrs, d, best_lr, div, early in curves:
+                c, mk = OPT_COLOR[opt], OPT_MARKER[opt]
+                inr = d <= ytop
+                for ax, xs in ((a0, lrs / best_lr), (a1, lrs)):
+                    tr = ax.get_xaxis_transform()
+                    ax.plot(xs, d, "-", color=c, zorder=3)
+                    ax.plot(xs[inr], d[inr], linestyle="none", color=c, marker=mk, ms=5,
+                            mew=0.7, zorder=4)
+                    if (~inr).any():
+                        flags["over"] = True
+                        ax.plot(xs[~inr], [0.955] * int((~inr).sum()), "^", color=c,
+                                ms=4.2, mew=0.6, transform=tr, zorder=5)
+                    scale = (1.0 / best_lr) if ax is a0 else 1.0
+                    for lr in div:
+                        flags["div"] = True
+                        ax.plot([lr * scale], [0.955], "x", color=c, mec=c, ms=6.5,
+                                mew=1.8, transform=tr, zorder=6)
+                    for lr in early:
+                        flags["early"] = True
+                        ax.plot([lr * scale], [0.955], "x", color=c, mec=c, ms=6.5,
+                                mew=1.8, transform=tr, zorder=6)
             for ax in (a0, a1):
                 ax.set_ylim(-0.04 * ytop, ytop)
                 ax.yaxis.set_major_locator(MaxNLocator(4))
@@ -1657,7 +1776,7 @@ def fig_a1(df, logs, outdir) -> list[Path]:
             a0.set_xscale("log", base=2)
             lo, hi = min(rel_all), max(rel_all)
             a0.set_xlim(lo / 1.5, hi * 1.5)
-            ks = range(math.ceil(math.log2(lo)), math.floor(math.log2(hi)) + 1)
+            ks = range(math.ceil(math.log2(lo) - 1e-9), math.floor(math.log2(hi) + 1e-9) + 1)
             step = 2 if len(ks) <= 9 else 3
             ticks = [2.0 ** k for k in ks if k % step == 0]
             a0.xaxis.set_major_locator(FixedLocator(ticks))
@@ -1673,10 +1792,19 @@ def fig_a1(df, logs, outdir) -> list[Path]:
                 a0.set_ylabel("Loss − sweep minimum\n(lower is better)")
                 a1.set_ylabel("Loss − sweep minimum\n(lower is better)")
         handles = [_opt_handle(o) for o in used]
-        if any_div:
-            handles.append(Line2D([], [], marker="x", color=INK, mec=INK, ms=6, mew=1.5,
-                                  linestyle="none", label="diverged"))
-        _legend(fig, handles, ncol=len(handles))
+        if flags["over"]:
+            handles.append(Line2D([], [], marker="^", color=PALE, ms=4.2, mew=0.6,
+                                  linestyle="none", label="above the axis limit"))
+        if flags["div"] and flags["early"]:
+            label = "diverged (this sweep or an earlier tuning pass)"
+        elif flags["early"]:
+            label = "diverged in an earlier tuning pass"
+        else:
+            label = "diverged"
+        if flags["div"] or flags["early"]:
+            handles.append(Line2D([], [], marker="x", color=INK2, mec=INK2, ms=6.5,
+                                  mew=1.8, linestyle="none", label=label))
+        _legend(fig, handles, ncol=4 if len(handles) > 5 else len(handles))
         return _save(fig, outdir, "a1_lr_sensitivity")
 
 
@@ -1848,6 +1976,10 @@ def fig_a3(df, logs, outdir) -> list[Path]:
                     if j == 0:
                         ax.set_ylabel("(c) AdamW\n2× budget", fontweight="bold")
         fig.supxlabel("Final validation loss (lower is better)", fontsize=9)
+        pairs = ({(r["study"], r["optimizer"]) for _, r in fa.iterrows()}
+                 | {(r["study"], r["optimizer"]) for _, r in ia.iterrows()})
+        n_txt = seeds_text("a3_robustness", {
+            f"{s}/{o}": int(len(an._fresh(df, s, o))) for s, o in sorted(pairs)})
         handles = [
             Line2D([], [], marker="o", color=PALE, ms=6, linestyle="none",
                    label="standard run (a, c: the paired seed; b: mean)"),
@@ -1856,7 +1988,7 @@ def fig_a3(df, logs, outdir) -> list[Path]:
             Line2D([], [], marker="o", color=PALE, ms=3.6, mec="white", mew=0.6,
                    linestyle="none", label="one seed"),
             Patch(facecolor=PALE, alpha=0.4, lw=0,
-                  label="(a) min–max of the 3 standard seeds"),
+                  label=f"(a) min–max of the {n_txt} standard seeds"),
         ]
         _legend(fig, handles, ncol=2)
         return _save(fig, outdir, "a3_robustness")
@@ -1885,7 +2017,7 @@ def fig_a4(df, logs, outdir) -> list[Path]:
                         ms=3.6, mew=0, alpha=0.38, zorder=2)
                 ax.plot(fresh["final_val_loss"], 100 * fresh["final_test_acc"],
                         linestyle="none", marker=OPT_MARKER[opt], color=OPT_COLOR[opt],
-                        ms=7, mew=0.9, zorder=3)
+                        ms=4.8, mec=INK, mew=0.5, zorder=3)
             _study_title(ax, study)
             ax.xaxis.set_major_locator(MaxNLocator(5))
         acc = runs["final_test_acc"].to_numpy(dtype=float)
@@ -1902,8 +2034,8 @@ def fig_a4(df, logs, outdir) -> list[Path]:
         handles = [_opt_handle(o, line=False) for o in OPT_ORDER
                    if o in set(runs["optimizer"])]
         handles += [
-            Line2D([], [], marker="o", color=PALE, ms=7, mew=0.9, linestyle="none",
-                   label="fresh-seed run"),
+            Line2D([], [], marker="o", color=PALE, ms=4.8, mec=INK, mew=0.5,
+                   linestyle="none", label="fresh-seed run (dark edge)"),
             Line2D([], [], marker="o", color=PALE, ms=3.6, mew=0, alpha=0.6,
                    linestyle="none", label="tuning / diagnostic run"),
             Line2D([], [], marker="|", color=INK, mec=INK, ms=9, mew=1.2,
@@ -1989,13 +2121,17 @@ def fig_a5(df, logs, outdir) -> list[Path]:
                 ax.grid(axis="y", visible=False)
                 ax.tick_params(axis="y", length=0)
                 ax.set_xlabel("Final validation loss (lower is better)")
-                ax.set_title(f"(a) {STUDY_LABEL[study]} ablations, seed 0")
+                other = sorted({int(r["seed"]) for _, r in fa.iterrows()} - {0})
+                ax.set_title(f"(a) {STUDY_LABEL[study]} ablations "
+                             + ("(seed 0 unless noted)" if other else "(seed 0)"))
                 used = [o for o in OPT_ORDER if o in {r["optimizer"] for r in rows}]
                 handles = [Line2D([], [], marker=OPT_MARKER[o], color=OPT_COLOR[o],
                                   ms=6.5, linestyle="none",
                                   label=f"{OPT_LABEL[o]} run") for o in used] + handles
             else:
                 opts = [o for o in OPT_ORDER if o in set(sp["optimizer"])]
+                n_sp = seeds_text("a5_manifold_audit (b)",
+                                  spectral_seed_counts(logs, df, "dense"))
                 rng = np.random.default_rng(0)
                 for x, opt in enumerate(opts):
                     v = sp[sp["optimizer"] == opt]["sigma"].to_numpy()
@@ -2018,8 +2154,8 @@ def fig_a5(df, logs, outdir) -> list[Path]:
                 ax.set_ylabel("Final σ$_{max}$ per matrix (log scale)")
                 ax.set_title("(b) Dense transformer")
                 handles.append(Line2D([], [], color=INK, lw=1.4,
-                                      label="(b) median over matrices; one point per "
-                                            "matrix, mean of 3 seeds"))
+                                      label=f"(b) median over matrices; one point per "
+                                            f"matrix, mean of {n_sp} seeds"))
         _legend(fig, handles, ncol=2)
         return _save(fig, outdir, "a5_manifold_audit")
 
@@ -2042,7 +2178,9 @@ def fig_a6(df, logs, outdir) -> list[Path]:
                     marker=OPT_MARKER[opt], color=OPT_COLOR[opt], linestyle="none",
                     ms=5.5, mew=0.8, zorder=4, clip_on=False)
         ax.set_xlabel("Tokens seen (millions)")
-        ax.set_ylabel("Max attention logit\n(mean, min–max over 3 seeds)")
+        n_txt = seeds_text("a6_attention_logits", {
+            o: int(d[d["optimizer"] == o]["n_seeds"].min()) for o in opts})
+        ax.set_ylabel(f"Max attention logit\n(mean, min–max over {n_txt} seeds)")
         ax.set_xlim(0, float(d["x"].max()) / 1e6 * 1.03)
         _legend(fig, [_opt_handle(o) for o in opts], ncol=3)
         return _save(fig, outdir, "a6_attention_logits")
@@ -2087,7 +2225,10 @@ def fig_a7(df, logs, outdir) -> list[Path]:
             if below >= len(kinds):
                 ax.tick_params(labelbottom=True)
         fig.supxlabel("Layer", fontsize=9)
-        fig.supylabel("Final σ$_{max}$, mean over 3 seeds (log scale)", fontsize=9)
+        n_txt = seeds_text("a7_spectral_norms_by_layer",
+                           spectral_seed_counts(logs, df, "dense"))
+        fig.supylabel(f"Final σ$_{{max}}$, mean over {n_txt} seeds (log scale)",
+                      fontsize=9)
         handles = [_opt_handle(o) for o in opts]
         if len(flat) > len(kinds):
             leg = flat[-1].legend(handles=handles, loc="center", ncol=1,
