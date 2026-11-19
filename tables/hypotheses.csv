@@ -5,5 +5,5 @@ H2b,dense,"manifold FLOP speedup [0.639, 0.721]; flop/token ratios {'muon': 0.96
 H3,B,insufficient data (no paired dense+moe fresh seeds),indistinguishable,"3-seed sign+2*std seed rule: a heuristic, not a test"
 H4,A,"|log2 lr shift| adamw 1.00, muon 0.00",supported,"3-seed sign+2*std seed rule: a heuristic, not a test"
 H5,A,mlp128: mean diff -0.0128 real=False; mlp256: mean diff -0.0020 real=False; mlp512: mean diff +0.0094 real=False,falsified,"3-seed sign+2*std seed rule: a heuristic, not a test"
-H6,A+B,"mlp128: diff -0.0147, basins muonall 0.00 vs muon 0.00; mlp256: diff -0.0107, basins muonall 0.00 vs muon 1.00; mlp512: diff -0.0178, basins muonall 1.00 vs muon 0.00; dense: diff -0.0533, basins muonall 2.00 vs muon 3.00",falsified,"3-seed sign+2*std seed rule: a heuristic, not a test"
+H6,A+B,"mlp128: diff -0.0147, basins muonall 0.00 vs muon 0.00; mlp256: diff -0.0107, basins muonall 0.00 vs muon 1.00; mlp512: diff -0.0178, basins muonall 0.00 vs muon 0.00; dense: diff -0.0533, basins muonall 2.00 vs muon 3.00",falsified,"3-seed sign+2*std seed rule: a heuristic, not a test"
 H7,moe,insufficient data (no fresh_seed MoE expert-entropy logs),indistinguishable,"3-seed sign+2*std seed rule: a heuristic, not a test"
