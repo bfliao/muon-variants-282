@@ -430,6 +430,44 @@ def flop_speedup_range(study: str, df: pd.DataFrame) -> pd.DataFrame:
     return _speedup_frame(study, df, "flops")
 
 
+_EXTRAP_COLS = ["max_budget", "n_extrapolated", "n_cells", "extrapolated"]
+
+
+def speedup_extrapolation(study: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Which speedups are EXTRAPOLATIONS of the fitted AdamW curve.
+
+    A cell of the {curve seed} x {optimizer seed} token-speedup matrix is an
+    extrapolation when its AdamW-equivalent data exceeds the largest budget
+    AdamW was actually run at on that curve seed (the largest D among that
+    seed's ``curve_points`` — read from the data, 2x in the frozen protocol),
+    or is inf (below the fitted asymptote).  The FLOP speedup is derived from
+    the same equivalent data, so the flag covers it too.
+
+    Returns a frame indexed by optimizer: ``max_budget`` (largest measured
+    AdamW budget as a multiple of 1x; the smallest over curve seeds),
+    ``n_extrapolated``, ``n_cells`` and ``extrapolated`` (any cell).  Empty
+    without budget-curve runs.
+    """
+    seeds = _curve_seeds(study, df)
+    tok = token_speedup_range(study, df)
+    if not seeds or tok.empty:
+        return pd.DataFrame(columns=_EXTRAP_COLS).rename_axis("optimizer")
+    d1 = _unit_size(_fresh(df, study, "adamw"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        top = np.array([max(d for d, _ in curve_points(study, s, df)) / d1
+                        for s in seeds])
+    records = []
+    for opt in tok.index:
+        mat = np.asarray(tok.loc[opt, "matrix"], dtype=float)
+        beyond = ~np.isfinite(mat) | (mat > top[:, None] * (1 + 1e-9))
+        records.append({"optimizer": opt, "max_budget": float(top.min()),
+                        "n_extrapolated": int(beyond.sum()),
+                        "n_cells": int(mat.size),
+                        "extrapolated": bool(beyond.any())})
+    return pd.DataFrame(records).set_index("optimizer")[_EXTRAP_COLS]
+
+
 # ---------------------------------------------------------------------------
 # Scalar metrics
 
@@ -445,6 +483,17 @@ def _hyper_norm(v):
             return None
     except (TypeError, ValueError):
         pass
+    return v
+
+
+def _hyper_key(v):
+    """``_hyper_norm`` with floats rounded to 10 significant digits, so the
+    same value written twice (0.3 vs 0.30000000000000004) compares equal."""
+    v = _hyper_norm(v)
+    if isinstance(v, tuple):
+        return tuple(_hyper_key(x) for x in v)
+    if isinstance(v, (float, np.floating)):
+        return float(f"{float(v):.10g}")
     return v
 
 
@@ -466,20 +515,27 @@ def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str,
 
     Selection of the cd lr-sweep cells:
 
-    1. Candidate rows: those labeled ``cd_sweep == "lr"`` when the configs
-       carry that field (written by studies.py), else every cd row.  The
-       label only PRE-FILTERS candidates — it does not decide membership,
-       because config dedup gives a re-run cell its FIRST label: the pass-2
-       lr sweep's centre cell was first run inside the wd sweep and stays
-       labeled "wd" on disk.
-    2. Context: candidates are grouped by the non-lr tuned hypers
-       (wd, momentum, grad_clip, adamw_betas, where present) and the group
-       containing the best (lowest final val loss) completed candidate gives
-       the final accepted context.
+    1. Context = the ACCEPTED values of the non-lr tuned hypers (wd,
+       momentum, grad_clip, adamw_betas, where present).  These are read off
+       the optimizer's completed fresh-seed runs, which are run at exactly
+       the accepted config — so the context is the accepted one whatever
+       ``cd_sweep`` labels the rows carry.  (Config dedup gives a re-run cell
+       its FIRST label: the pass-2 lr sweep's centre cell was first run
+       inside the wd / momentum sweep and stays labeled "wd" / "momentum" on
+       disk, and it usually BEATS every lr-labeled cell of pass 1, so the
+       labels alone cannot find the context.)
+    2. Fallback, only when there are no fresh-seed runs yet (or none of the
+       cd rows sits at their config): among the contexts that contain an
+       lr-labeled row (every context if the rows carry no labels), the one
+       containing the best (lowest final val loss) completed cd row of ANY
+       label.
     3. Membership: every cd row — whatever its ``cd_sweep`` label — whose
        non-lr hypers match that context.  This re-admits the deduped centre
        cell and excludes lr cells run under an earlier context (e.g. the
        pass-1 sweep at the pre-acceptance wd).
+
+    ``muonarch.figures.lr_sweep`` is a thin view of this function; there is
+    no second implementation.
 
     Returns both completed and diverged rows (figure_2 marks the diverged
     ones); callers that need losses filter on status themselves.
@@ -494,21 +550,29 @@ def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str,
     if not _has_cd_rows(df, study):
         return stage
     if not cd.empty:
-        if "cd_sweep" in cd.columns and cd["cd_sweep"].notna().any():
-            cand = cd[cd["cd_sweep"] == "lr"]
-        else:
-            cand = cd
         keys = [k for k in _CD_OTHER_HYPERS if k in cd.columns]
 
         def _key(r):
-            return tuple(_hyper_norm(r.get(k)) for k in keys)
+            return tuple(_hyper_key(r.get(k)) for k in keys)
 
-        comp = cand[cand["status"] == "completed"].dropna(subset=["final_val_loss"])
-        if comp.empty:
-            cd = cd.iloc[0:0]
-        else:
-            best_key = _key(comp.loc[comp["final_val_loss"].idxmin()])
-            cd = cd[cd.apply(lambda r: _key(r) == best_key, axis=1)]
+        cd_keys = cd.apply(_key, axis=1)
+        ctx = None
+        fresh = _fresh(df, study, opt)
+        if not fresh.empty:
+            fresh_key = _key(fresh.iloc[0])
+            if (cd_keys == fresh_key).any():
+                ctx = fresh_key
+        if ctx is None:
+            if "cd_sweep" in cd.columns and cd["cd_sweep"].notna().any():
+                swept = set(cd_keys[cd["cd_sweep"] == "lr"])
+            else:
+                swept = set(cd_keys)
+            pool = cd[cd_keys.isin(swept) & (cd["status"] == "completed")]
+            pool = pool.dropna(subset=["final_val_loss"])
+            if pool.empty:
+                return cd.iloc[0:0]
+            ctx = cd_keys[pool["final_val_loss"].idxmin()]
+        cd = cd[cd_keys == ctx]
     return cd
 
 
@@ -1465,16 +1529,22 @@ def figure_8(df: pd.DataFrame, outdir: Path | str,
 # ---------------------------------------------------------------------------
 # Main table
 
-def _fmt_range(frame: pd.DataFrame, opt: str) -> str:
+EXTRAPOLATION_MARK = "†"
+
+
+def _fmt_range(frame: pd.DataFrame, opt: str, mark: bool = False) -> str:
     if frame.empty or opt not in frame.index:
         return "—"
     lo, hi = frame.loc[opt, "speedup_min"], frame.loc[opt, "speedup_max"]
-    return f"[{lo:.2f}, {hi:.2f}]"
+    return f"[{lo:.2f}, {hi:.2f}]" + (EXTRAPOLATION_MARK if mark else "")
 
 
 def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
     """tables/main.md: final loss mean±std, token and FLOP speedup ranges,
-    LR-basin width and divergence rate per optimizer x study.  Study A and
+    LR-basin width and divergence rate per optimizer x study.  Speedup
+    ranges that rely on extrapolating the fitted AdamW curve beyond its
+    largest measured budget (``speedup_extrapolation``) carry a dagger and a
+    one-line footnote.  Study A and
     Study B are separate sections with NO cross-study ranking.  The per-study
     winner (lowest mean loss) is bolded only where the seed rule passes
     against the runner-up — and the seed rule is labeled a heuristic.
@@ -1490,6 +1560,7 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
         "across the two studies.",
         "",
     ]
+    extrap_budgets: list[float] = []
     sections = [("Study A — MLP width study (CIFAR-5m)", STUDY_A),
                 ("Study B — dense vs MoE transformer (FineWeb-Edu)", STUDY_B)]
     for title, group in sections:
@@ -1510,6 +1581,7 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
                 pair = _paired_vs(df, study, winner, order[1])
                 bold = pair is not None and seed_rule(*pair)
             tok, fl = token_speedup_range(study, df), flop_speedup_range(study, df)
+            ext = speedup_extrapolation(study, df)
             tol = 0.01 if study.startswith("mlp") else 0.02
             lines += [
                 f"### {study}", "",
@@ -1523,10 +1595,21 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
                 bw_s = "—" if math.isnan(bw) else f"{bw:.2f}"
                 dr = divergence_rate(study, o, df)
                 dr_s = "—" if math.isnan(dr) else f"{dr:.1%}"
+                mark = bool(o in ext.index and ext.loc[o, "extrapolated"])
+                if mark:
+                    extrap_budgets.append(float(ext.loc[o, "max_budget"]))
                 lines.append(
                     f"| {name} | {means[o]:.4f} ± {stds[o]:.4f} | "
-                    f"{_fmt_range(tok, o)} | {_fmt_range(fl, o)} | {bw_s} | {dr_s} |")
+                    f"{_fmt_range(tok, o, mark)} | {_fmt_range(fl, o, mark)} | "
+                    f"{bw_s} | {dr_s} |")
             lines.append("")
+    if extrap_budgets:
+        b = sorted(set(extrap_budgets))
+        b_s = f"{b[0]:g}×" if len(b) == 1 else f"{b[0]:g}×–{b[-1]:g}×"
+        lines += [f"{EXTRAPOLATION_MARK} Extrapolated: for at least one (AdamW curve "
+                  f"seed, optimizer seed) pair the AdamW-equivalent data exceeds the "
+                  f"largest measured AdamW budget ({b_s}), so the speedup is read off "
+                  f"the fitted curve beyond the data.", ""]
     nulls = null_result_rows(df)
     if not nulls.empty:
         lines += ["## Null results (indistinguishable after equal tuning)", "",

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 import math
 from pathlib import Path
 
@@ -211,8 +212,11 @@ def make_world(root: Path) -> None:
             for seed in (1, 2, 3):
                 s = PLANTED[study].get(opt, 1.0)
                 loss = curve(study, s * d1) + SEED_EPS[seed]
+                # fresh seeds run at the ACCEPTED config: on mlp128 the
+                # coordinate descent accepted wd=0.03 (see the cd rows below)
+                fresh_wd = 0.03 if study == "mlp128" else 0.01
                 cfg = _cfg(study, opt, "fresh_seed", seed, BEST_LR[opt],
-                           None if opt == "manifold" else 0.01, 1.0)
+                           None if opt == "manifold" else fresh_wd, 1.0)
                 h, _ = _write_result(root, cfg, loss)
                 _write_log(root, cfg, h, loss)
 
@@ -924,3 +928,158 @@ def test_partial_and_diagnostics_logs_never_counted(tmp_path):
     assert attn["max_attn_logit"].max() < 10
     _, sn = an.spectral_norm_means(lg, df=res)
     assert list(sn.columns) == ["adamw"]
+
+
+# ------------------------------------- accepted-context lr sweep (review fix)
+
+def _accepted_centre_cd(label="wd", fresh=True):
+    """The real failure mode: a two-pass coordinate descent whose ACCEPTED
+    centre cell was first run inside the wd (or momentum) sweep, keeps that
+    label after dedup, and beats every lr-labeled row — while the best
+    lr-labeled row sits in the pre-acceptance pass-1 sweep."""
+    rows = []
+
+    def r(phase, lr, loss, wd, mom, sweep=None, **kw):
+        rows.append(dict(study="mlp512", optimizer="moonlight", phase=phase, lr=lr,
+                         wd=wd, momentum=mom, final_val_loss=loss, seed=0,
+                         status="completed", cd_sweep=sweep, **kw))
+    new = dict(wd=0.03, mom=0.95) if label == "wd" else dict(wd=0.01, mom=0.9)
+    for lr, loss in [(0.005, 0.80), (0.01, 0.700), (0.02, 0.705), (0.04, 0.90)]:
+        r("cd", lr, loss, 0.01, 0.95, "lr")                    # pass 1
+    r("cd", 0.01, 0.650, sweep=label, **new)                   # accepted centre
+    for lr, loss in [(0.005, 0.78), (0.02, 0.72), (0.04, 0.85)]:
+        r("cd", lr, loss, sweep="lr", **new)                   # pass 2
+    if fresh:
+        for s in (1, 2, 3):
+            rows.append(dict(study="mlp512", optimizer="moonlight",
+                             phase="fresh_seed", lr=0.01, final_val_loss=0.65,
+                             seed=s, status="completed", cd_sweep=None,
+                             budget_multiplier=1.0,
+                             wd=new["wd"], momentum=new["mom"]))
+    return pd.DataFrame(rows)
+
+
+@pytest.mark.parametrize("label", ["wd", "momentum"])
+@pytest.mark.parametrize("fresh", [True, False])
+def test_lr_sweep_rows_use_the_accepted_context(label, fresh):
+    d = _accepted_centre_cd(label, fresh)
+    rows = an._lr_sweep_rows(d, "mlp512", "moonlight")
+    # the accepted-context sweep: 3 lr-labeled pass-2 cells + the centre
+    assert sorted(rows["lr"]) == [0.005, 0.01, 0.02, 0.04]
+    assert sorted(rows["final_val_loss"]) == [0.65, 0.72, 0.78, 0.85]
+    centre = rows[rows["lr"] == 0.01].iloc[0]
+    assert centre["cd_sweep"] == label and centre["final_val_loss"] == 0.65
+    # no pass-1 (pre-acceptance) cell
+    assert not set(rows["final_val_loss"]) & {0.80, 0.700, 0.705, 0.90}
+    # the basin follows: pass 1 has a 1-octave basin at 1% (0.700 / 0.705),
+    # the accepted-context sweep has none (0.65 vs 0.72)
+    assert an.lr_basin_width("mlp512", "moonlight", d, 0.01) == 0.0
+    if fresh:
+        assert an._best_lr(d, "mlp512", "moonlight") == pytest.approx(0.01)
+
+
+def test_lr_sweep_rows_pass1_basin_would_differ():
+    # guard for the fixture itself: the pre-acceptance sweep alone gives the
+    # (wrong) basin width 1.0, so the test above can tell the two apart
+    d = _accepted_centre_cd("wd")
+    pass1 = d[(d["phase"] == "cd") & (d["wd"] == 0.01)]
+    assert an.lr_basin_width("mlp512", "moonlight", pass1, 0.01) == 1.0
+
+
+def test_lr_sweep_rows_inherited_track_unchanged():
+    d = _accepted_centre_cd("wd")
+    extra = pd.DataFrame([dict(study="mlp512", optimizer="moonlight",
+                               phase="stage_a", lr=lr, wd=0.01, momentum=0.95,
+                               final_val_loss=loss, seed=0, status="completed")
+                          for lr, loss in [(0.001, 0.9), (0.002, 0.8)]])
+    d = pd.concat([d, extra], ignore_index=True)
+    inh = an._lr_sweep_rows(d, "mlp512", "moonlight", track="inherited")
+    assert set(inh["phase"]) == {"stage_a"} and len(inh) == 2
+    assert set(an._lr_sweep_rows(d, "mlp512", "moonlight")["phase"]) == {"cd"}
+
+
+# ------------------------------------------------- extrapolation flag (review)
+
+def _beyond_budget(df, study="dense", opt="muon", margin=1e-3):
+    """``df`` with ``opt``'s fresh-seed losses just below the loss of AdamW's
+    largest-budget curve point (the best over curve seeds)."""
+    best = min(max(an.curve_points(study, s, df))[1]
+               for s in an._curve_seeds(study, df))
+    d = df.copy()
+    m = ((d["study"] == study) & (d["optimizer"] == opt)
+         & (d["phase"] == "fresh_seed"))
+    d.loc[m, "final_val_loss"] = best - margin
+    return d
+
+
+def test_speedup_extrapolation_reads_the_largest_budget_from_data(df, monkeypatch):
+    ext = an.speedup_extrapolation("dense", df)
+    assert set(ext.index) == set(an.token_speedup_range("dense", df).index)
+    assert (ext["max_budget"] == 2.0).all()        # the world's largest AdamW run
+    assert (ext["n_cells"] == 9).all()
+    assert not ext["extrapolated"].any()           # planted speedups <= 1.3x
+    # a Muon that beats AdamW's best 2x run: its AdamW-equivalent data lies
+    # beyond the largest measured budget for every (curve seed, run seed)
+    e1 = an.speedup_extrapolation("dense", _beyond_budget(df))
+    assert (e1["max_budget"] == 2.0).all()
+    assert bool(e1.loc["muon", "extrapolated"]) and e1.loc["muon", "n_extrapolated"] == 9
+    assert not bool(e1.loc["manifold", "extrapolated"])        # 0.9x: inside the data
+    # the threshold is the largest measured curve point, not a constant 2:
+    # with curve points that stop at 1x, the planted 1.3x Muon (inside the
+    # data above) is beyond it, the 0.9x Manifold still is not
+    real = an.curve_points
+    monkeypatch.setattr(an, "curve_points",
+                        lambda study, seed, d: real(study, seed, d)[:-1])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        e2 = an.speedup_extrapolation("dense", df)
+    assert (e2["max_budget"] == 1.0).all()
+    assert bool(e2.loc["muon", "extrapolated"])
+    assert not bool(e2.loc["manifold", "extrapolated"])
+    assert an.speedup_extrapolation("moe", df).empty           # no budget curve
+
+
+def test_main_table_marks_extrapolated_ranges(df, tmp_path):
+    plain = an.main_table(df, tmp_path / "a").read_text()
+    assert an.EXTRAPOLATION_MARK not in plain
+    text = an.main_table(_beyond_budget(_beyond_budget(df), "mlp128"),
+                         tmp_path / "b").read_text()
+    row = next(l for l in text.splitlines() if l.startswith("| **muon** |")
+               or l.startswith("| muon |"))
+    assert row.count("]" + an.EXTRAPOLATION_MARK) == 2         # token and FLOP range
+    notes = [l for l in text.splitlines() if l.startswith(an.EXTRAPOLATION_MARK)]
+    assert len(notes) == 1 and "largest measured AdamW budget (2×)" in notes[0]
+    man = [l for l in text.splitlines() if "manifold" in l and l.startswith("|")]
+    assert man and all(an.EXTRAPOLATION_MARK not in l for l in man)
+
+
+# ------------------------------------------------ log filtering (review)
+
+def test_completed_fresh_hashes_ignores_non_completed():
+    rows = [dict(study="dense", phase="fresh_seed", status=st, hash=h,
+                 budget_multiplier=m)
+            for st, h, m in [("completed", "ok", 1.0), ("stopped", "parked", 1.0),
+                             ("diverged", "div", 1.0), ("running", "run", 1.0),
+                             ("completed", "double", 2.0)]]
+    rows.append(dict(study="dense", phase="cd", status="completed", hash="tune",
+                     budget_multiplier=1.0))
+    assert an._completed_fresh_hashes(pd.DataFrame(rows)) == {"ok"}
+    assert an._completed_fresh_hashes(None) is None
+    assert an._completed_fresh_hashes(pd.DataFrame()) is None
+
+
+def test_load_logs_skips_files_directly_under_diagnostics(tmp_path):
+    def write(path, h):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cfg = dict(study="mlp128", optimizer="muon", phase="fresh_seed", seed=1,
+                   lr=0.01, budget_multiplier=1.0)
+        recs = [{"t": "start", "hash": h, "config": cfg},
+                {"t": "eval", "step": 1, "images_or_tokens": 256, "val_loss": 1.0},
+                {"t": "final", "val_loss": 0.9}]
+        path.write_text("\n".join(json.dumps(x) for x in recs) + "\n")
+    write(tmp_path / "logs" / "mlp128" / "keep.jsonl", "keep")
+    write(tmp_path / "logs" / "diagnostics" / "parked.jsonl", "parked")       # one level
+    write(tmp_path / "logs" / "diagnostics" / "audit" / "deep.jsonl", "deep")  # nested
+    logs = an.load_logs(tmp_path)
+    assert set(logs["hash"]) == {"keep"}
+    assert len(logs) == 2
