@@ -611,6 +611,31 @@ def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str,
     return cd
 
 
+def has_accepted_lr_sweep(df: pd.DataFrame, study: str, opt: str) -> bool:
+    """Whether the headline lr-sweep rows (``_lr_sweep_rows``) are a real
+    learning-rate sweep, i.e. whether a basin width read off them is a
+    measurement.
+
+    False only for a coordinate-descent study whose rows carry ``cd_sweep``
+    labels when NO row at the selected context was run as part of an lr sweep
+    (label "lr"): the learning rate is tuned first in every pass, so this
+    happens exactly when a hyperparameter tuned later in the last pass
+    changed afterwards, and the rows at the accepted context are then only
+    stray cells of other sweeps (typically the accepted value and one
+    neighbour below it — nothing above it was run).  True for Stage-A
+    studies, for unlabelled frames, and whenever an lr-labelled row sits at
+    the context.  ``lr_basin_width`` itself is unchanged; ``main_table``
+    uses this to print a dash instead of a number that was not measured.
+    The same rule as ``muonarch.figures.cd_slices`` (role "accepted")."""
+    rows = _lr_sweep_rows(df, study, opt, "headline")
+    if rows.empty or not (rows["phase"] == "cd").any():
+        return True
+    cd = df[(df["study"] == study) & (df["optimizer"] == opt) & (df["phase"] == "cd")]
+    if "cd_sweep" not in cd.columns or not cd["cd_sweep"].notna().any():
+        return True
+    return bool((rows["cd_sweep"] == "lr").any())
+
+
 def inherited_best_lr(df: pd.DataFrame, study: str, opt: str) -> float | None:
     """lr of the min seed-0 final-loss trial of the INHERITED Phase-II track
     (stage_a/stage_b/edge) — H4's inherited optimum in mlp256/mlp512, to set
@@ -1590,6 +1615,18 @@ def figure_8(df: pd.DataFrame, outdir: Path | str,
 # Main table
 
 EXTRAPOLATION_MARK = "†"
+#: Marks an LR-basin cell that is not a measurement (``has_accepted_lr_sweep``).
+NO_SWEEP_MARK = "‡"
+#: Row order and display names of tables/main.md — those of the report
+#: figures (``muonarch.figures.OPT_ORDER`` / ``OPT_LABEL``; a test keeps the
+#: two in step).  ``OPTIMIZERS`` keeps its historical order for everything
+#: else.
+TABLE_ORDER: tuple[str, ...] = ("adamw", "muon", "moonlight", "muonall", "lionmuon",
+                                "manifold")
+OPTIMIZER_LABEL: dict[str, str] = {
+    "adamw": "AdamW", "muon": "Muon", "moonlight": "Moonlight",
+    "muonall": "MuonAll", "lionmuon": "Lion-Muon", "manifold": "Manifold Muon",
+}
 
 
 def _fmt_range(frame: pd.DataFrame, opt: str, mark: bool = False) -> str:
@@ -1604,7 +1641,10 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
     LR-basin width and divergence rate per optimizer x study.  Speedup
     ranges that rely on extrapolating the fitted AdamW curve beyond its
     largest measured budget (``speedup_extrapolation``) carry a dagger and a
-    one-line footnote.  Study A and
+    one-line footnote.  An LR-basin cell without a learning-rate sweep at the
+    accepted configuration (``has_accepted_lr_sweep``) is a dash with a
+    double dagger and a one-line footnote, not a number.  Rows follow
+    ``TABLE_ORDER`` with the display names ``OPTIMIZER_LABEL``.  Study A and
     Study B are separate sections with NO cross-study ranking.  The per-study
     winner (lowest mean loss) is bolded only where the seed rule passes
     against the runner-up — and the seed rule is labeled a heuristic.
@@ -1621,6 +1661,7 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
         "",
     ]
     extrap_budgets: list[float] = []
+    no_sweep = False
     sections = [("Study A — MLP width study (CIFAR-5m)", STUDY_A),
                 ("Study B — dense vs MoE transformer (FineWeb-Edu)", STUDY_B)]
     for title, group in sections:
@@ -1629,7 +1670,7 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
             continue
         lines += [f"## {title}", ""]
         for study in studies:
-            opts = [o for o in OPTIMIZERS if not _fresh(df, study, o).empty]
+            opts = [o for o in TABLE_ORDER if not _fresh(df, study, o).empty]
             if not opts:
                 continue
             means = {o: float(_fresh(df, study, o)["final_val_loss"].mean()) for o in opts}
@@ -1650,9 +1691,12 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
                 "| --- | --- | --- | --- | --- | --- |",
             ]
             for o in opts:
-                name = f"**{o}**" if (o == winner and bold) else o
+                lab = OPTIMIZER_LABEL.get(o, o)
+                name = f"**{lab}**" if (o == winner and bold) else lab
                 bw = lr_basin_width(study, o, df, tol)
                 bw_s = "—" if math.isnan(bw) else f"{bw:.2f}"
+                if not math.isnan(bw) and not has_accepted_lr_sweep(df, study, o):
+                    bw_s, no_sweep = f"—{NO_SWEEP_MARK}", True
                 dr = divergence_rate(study, o, df)
                 dr_s = "—" if math.isnan(dr) else f"{dr:.1%}"
                 mark = bool(o in ext.index and ext.loc[o, "extrapolated"])
@@ -1670,6 +1714,10 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
                   f"seed, optimizer seed) pair the AdamW-equivalent data exceeds the "
                   f"largest measured AdamW budget ({b_s}), so the speedup is read off "
                   f"the fitted curve beyond the data.", ""]
+    if no_sweep:
+        lines += [f"{NO_SWEEP_MARK} Not measured: no learning-rate sweep exists at the "
+                  f"accepted configuration: a hyperparameter tuned later in the pass "
+                  f"changed afterwards.", ""]
     nulls = null_result_rows(df)
     if not nulls.empty:
         lines += ["## Null results (indistinguishable after equal tuning)", "",
@@ -1679,7 +1727,9 @@ def main_table(df: pd.DataFrame, outdir: Path | str) -> Path:
         lines += ["| study | optimizer | vs | mean diff | seed spread |",
                   "| --- | --- | --- | --- | --- |"]
         for _, r in nulls.iterrows():
-            lines.append(f"| {r['study']} | {r['optimizer']} | {r['vs']} | "
+            lines.append(f"| {r['study']} | "
+                         f"{OPTIMIZER_LABEL.get(r['optimizer'], r['optimizer'])} | "
+                         f"{OPTIMIZER_LABEL.get(r['vs'], r['vs'])} | "
                          f"{r['mean_diff']:+.5f} | {r['seed_spread']:.5f} |")
         lines.append("")
     lines += ["", edge_rule_report(df), ""]

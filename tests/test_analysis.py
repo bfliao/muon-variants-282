@@ -776,7 +776,7 @@ def test_main_table_mean_std(df, tmp_path):
     for col in ("token speedup", "FLOP speedup", "basin", "divergence"):
         assert col.lower() in text.lower()
     # dense winner muon passes the seed rule (planted gap >> spread) -> bold
-    assert "**muon**" in text
+    assert "**Muon**" in text
     # moe has no budget curve: speedup cells degrade gracefully, not crash
     assert "moe" in text
 
@@ -1147,12 +1147,12 @@ def test_main_table_marks_extrapolated_ranges(df, tmp_path):
     assert an.EXTRAPOLATION_MARK not in plain
     text = an.main_table(_beyond_budget(_beyond_budget(df), "mlp128"),
                          tmp_path / "b").read_text()
-    row = next(l for l in text.splitlines() if l.startswith("| **muon** |")
-               or l.startswith("| muon |"))
+    row = next(l for l in text.splitlines() if l.startswith("| **Muon** |")
+               or l.startswith("| Muon |"))
     assert row.count("]" + an.EXTRAPOLATION_MARK) == 2         # token and FLOP range
     notes = [l for l in text.splitlines() if l.startswith(an.EXTRAPOLATION_MARK)]
     assert len(notes) == 1 and "largest measured AdamW budget (2×)" in notes[0]
-    man = [l for l in text.splitlines() if "manifold" in l and l.startswith("|")]
+    man = [l for l in text.splitlines() if "Manifold Muon" in l and l.startswith("|")]
     assert man and all(an.EXTRAPOLATION_MARK not in l for l in man)
 
 
@@ -1325,15 +1325,15 @@ def test_generic_metrics_include_lionmuon(df, lion_df, lion_logs):
 def test_main_table_gains_lionmuon_rows_and_nothing_else(df, lion_df, tmp_path):
     base = an.main_table(df, tmp_path / "base").read_text().splitlines()
     full = an.main_table(lion_df, tmp_path / "lion").read_text().splitlines()
-    assert not any("lionmuon" in l for l in base)
+    assert not any("Lion-Muon" in l or "lionmuon" in l for l in base)
     added = [l for l in full if l not in base]
     lost = [l for l in base if l not in full]
-    lm = [l for l in full if l.startswith(("| lionmuon |", "| **lionmuon** |"))]
+    lm = [l for l in full if l.startswith(("| Lion-Muon |", "| **Lion-Muon** |"))]
     assert len(lm) == 2                                    # mlp128 and dense, not moe
     # Lion-Muon is planted best in both studies with a clear gap: it is the
     # bold winner there, so a former bold winner's row loses its bold — the
     # only lines of the five-optimizer table that change
-    assert all(l.startswith("| **lionmuon** |") for l in lm)
+    assert all(l.startswith("| **Lion-Muon** |") for l in lm)
     assert all(l.startswith("| **") for l in lost)
     assert sorted(added) == sorted(lm + [l.replace("**", "") for l in lost])
     for study, row in zip(("mlp128", "dense"), lm):        # Study A section first
@@ -1349,7 +1349,7 @@ def test_main_table_gains_lionmuon_rows_and_nothing_else(df, lion_df, tmp_path):
     text = an.main_table(_beyond_budget(lion_df, "dense", "lionmuon"),
                          tmp_path / "ext").read_text()
     mlp_row, dense_row = [l for l in text.splitlines()
-                          if l.startswith(("| lionmuon |", "| **lionmuon** |"))]
+                          if l.startswith(("| Lion-Muon |", "| **Lion-Muon** |"))]
     assert dense_row.count("]" + an.EXTRAPOLATION_MARK) == 2    # token and FLOP range
     assert an.EXTRAPOLATION_MARK not in mlp_row
 
@@ -1420,3 +1420,25 @@ def test_legacy_figures_render_with_lionmuon(lion_df, lion_logs, tmp_path):
     for fn in (an.figure_3, an.figure_8):
         p = fn(lion_df, tmp_path, logs=lion_logs)
         assert p.exists() and p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_main_table_rows_follow_the_figure_order_and_labels(lion_df, tmp_path):
+    assert set(an.TABLE_ORDER) == set(an.OPTIMIZERS) == set(an.OPTIMIZER_LABEL)
+    assert an.TABLE_ORDER == ("adamw", "muon", "moonlight", "muonall", "lionmuon",
+                              "manifold")
+    text = an.main_table(lion_df, tmp_path / "t").read_text()
+    labels = [an.OPTIMIZER_LABEL[o] for o in an.TABLE_ORDER]
+    for study in ("mlp128", "dense"):
+        block = text.split(f"### {study}")[1].split("###")[0].split("##")[0]
+        names = [l.split("|")[1].strip().strip("*") for l in block.splitlines()
+                 if l.startswith("| ") and "---" not in l and "optimizer" not in l]
+        assert names == labels, study
+    # no raw optimizer id is left in any table row
+    rows = [l for l in text.splitlines() if l.startswith("| ")]
+    assert not any(f"| {o} |" in l or f"| **{o}** |" in l
+                   for l in rows for o in an.OPTIMIZERS)
+    # every real sweep keeps its number: no "not measured" mark in this world
+    assert an.NO_SWEEP_MARK not in text
+    for study in ("mlp128", "dense", "moe"):
+        for opt in an.OPTIMIZERS:
+            assert an.has_accepted_lr_sweep(lion_df, study, opt), (study, opt)

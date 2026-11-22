@@ -22,6 +22,9 @@ curve with a labelled arrow), Semenov et al. 2509.01440 (small-multiple sweeps).
   | muonall | MuonAll | `#e87ba4` | triangle down `v` |
   | lionmuon | Lion-Muon | `#6b3fa0` | filled plus `P` |
 
+  The filled plus has thin arms, so it is drawn 1.25 × the nominal marker size with a thinner
+  white edge (`figures.MARKER_WEIGHT`, `figures._mk`) to weigh as much as the other shapes.
+
 - Optimizer order is always AdamW, Muon, Moonlight, MuonAll, Lion-Muon, Manifold Muon.
 - Lion-Muon is the sixth optimizer, added after the protocol freeze (DEVIATIONS #15). It appears
   in a figure, panel or legend only where it has data: a study without Lion-Muon runs gets no
@@ -49,6 +52,26 @@ curve with a labelled arrow), Semenov et al. 2509.01440 (small-multiple sweeps).
   `analysis.headline_tuning_phases(df, study)` (cd where it exists). Never mix the inherited
   track (stage_a/stage_b/edge at MLP-256/512) into headline plots. Diverged runs are drawn as an
   `x` at the top of the panel, never dropped silently.
+- **A divergence belongs to the hyperparameter being swept.** A coordinate-descent run that
+  diverged carries the `cd_sweep` label of the sweep it was run in; it is drawn in that
+  hyperparameter's F6 cell only. The learning-rate figures (F5, A1, A8) show a diverged `x`
+  only for runs of a learning-rate sweep (or of a phase without sweep labels), so e.g. a
+  Lion-Muon run that diverged at α = 3 is an `x` in F6's α cell, not a diverged learning rate.
+- **No sweep at the accepted configuration.** The coordinate descent is limited to two passes
+  (lr, wd, α, momentum, β2, clip). When a hyperparameter tuned later in the last pass changes,
+  the hyperparameters before it have no sweep at the final accepted configuration (first seen
+  for Lion-Muon at MLP-256 / MLP-512: β2 changed after the lr, wd and α sweeps). The figures
+  then draw the **most recent sweep** of that hyperparameter instead — the sweep that contains
+  the accepted value and whose context differs from the accepted configuration in the fewest
+  hyperparameters (`cd_slices` role `"last"`, `lr_sweep_shown`, `last_sweep_cells`) — always
+  **dashed**, with a legend entry saying why, and the accepted / selected value still marked
+  on it. The legend / footnote names the hyperparameter that changed and its earlier and
+  accepted value ("β₂ 0.99 → 0.95"), so a marker on a dashed curve is not read as the loss of
+  the accepted configuration. `analysis._lr_sweep_rows` and `lr_basin_width` keep their
+  accepted-context semantics; `tables/main.md` prints "—‡" (not measured) for the LR basin of
+  such a cell (`analysis.has_accepted_lr_sweep`, the same rule). The table lists the
+  optimizers in the figure order with the figure labels. `figures.py` prints a note naming
+  the affected cells.
 
 ## Main-text figures
 
@@ -61,7 +84,8 @@ order. x axis per panel (not shared; scales differ). Answers: who wins, by how m
 row FLOP speedup; columns = studies. Horizontal dot + whisker (min–max over the 3×3 seed matrix
 from `token_speedup_range` / `flop_speedup_range`), log x, vertical line at 1 labelled once
 "AdamW". Value label "2.3×" beside each marker. Shade x < 1 very lightly ("slower than AdamW").
-Shared x range within a row. Row labels at the left ("Per token / image", "Per FLOP").
+Shared x range within a row. Row labels at the left ("Per token / image", "Per FLOP"), and the
+optimizer names on the left panel of each row, as in F1.
 
 **F3 `f3_budget_curve` — How speedup is measured.** 4 panels (studies). x = training data as a
 multiple of the 1× budget (log2: 0.125, 0.25, 0.5, 1, 2), y = AdamW final val loss. AdamW points
@@ -84,7 +108,12 @@ a panel stays legible at the 7.2 in width. x = learning rate (log2), y = final v
 light→dark), headline tuning data (seed 0 lr sweep: `cd` rows with `cd_sweep == "lr"` plus the
 accepted centre), a filled marker with dark edge on each curve's minimum, and a short vertical
 tick or arrow annotation showing the shift between the 128 and 512 optimum ("÷2" for AdamW,
-"no shift" where equal). Shared y within the figure is not required (losses differ by width):
+"no shift" where equal). The annotation is computed from the **selected** learning rates (the
+fresh-seed configs) for every optimizer, never from the minimum of a drawn curve, and its title
+says so (`figures.shift_title`, one rule for all: "Selected LR, 128→512: no shift" only when
+all widths agree, "…128→512: ÷2" when the selected LR moves monotonically, and every step,
+"…128→256→512: ×2, ÷2", when it does not). A width without an lr sweep at the accepted configuration
+shows its last lr sweep dashed (house style), with the selected LR marked on it. Shared y within the figure is not required (losses differ by width):
 instead plot **loss minus that curve's minimum** in a second row so basin shapes are comparable
 (TP5 variant), y clipped at ~0.15. **F5b `f5b_optimal_lr_vs_width`**: small-multiples summary,
 one panel per optimizer in one row (shared log2 y), x = width (ticks exactly 128/256/512), re-tuned optimum
@@ -100,12 +129,19 @@ momentum. With six columns the titles take two lines and the x tick labels are 7
 Each cell: x = the hyperparameter value (log x for lr and for α, where every tested value has a
 tick and every other one a label; categorical-evenly-spaced for wd incl. 0,
 momentum, β2, clip incl. "none"), y = final val loss − best loss for that optimizer (≥ 0), points
-joined by a line in the optimizer colour; the accepted value marked with a star; a light grey
+joined by a line in the optimizer colour; the accepted value marked with a star (a cell without
+a sweep at the accepted configuration draws its last sweep dashed and marks the accepted value
+on it with a **hollow** star — that curve legitimately does not reach 0 — and a footnote names
+the cells and the hyperparameter that changed afterwards); a light grey
 band from 0 to the acceptance threshold (2 × pilot seed std for that study — get it from the
 pilot rows / `studies` helper) labelled once "noise". Cells for hyperparameters an optimizer does
 not have (e.g. β2 for Muon, wd for Manifold, α for all but Lion-Muon) are blank with a small
 grey "n/a". y clipped (same
-limit across a row) with out-of-range points drawn as `^` at the top edge, diverged as `x`.
+limit across a row) with out-of-range points drawn as `^` at the top edge, diverged as `x`
+(raised just above the frame where it would sit on a `^` of another sweep).
+The row limit (`figures.f6_row_limit`) is set by the main sweep of each cell only — never by an
+earlier-pass sweep: the largest value of the categorical sweeps, the third-smallest of the
+log-grid sweeps (lr, α), at least 2.6 × the noise threshold, plus 22% headroom.
 Second-pass CD points included. Wen et al. show this only as tables; we show the grid.
 
 **F7 `f7_compute_cost` — Where the FLOPs go.** 4 panels (studies), horizontal stacked bars per
@@ -122,12 +158,17 @@ fails the seed rule. Direct labels at the right end instead of a legend.
 ## Appendix figures
 
 **A1 `a1_lr_sensitivity` — Loss vs LR, all optimizers.** 4 panels; x = LR / that optimizer's best
-LR (log2, vertical line at 1), y = loss − best (clipped), one line per optimizer; diverged `x`.
-Shows basin width directly (H6). A second row with the raw LR axis.
+LR (log2, vertical line at 1), y = loss − best (clipped), one line per optimizer; diverged `x`
+on a rail just above the frame (so it never hides another optimizer's `^` at the same LR).
+Shows basin width directly (H6). A second row with the raw LR axis. An optimizer without an lr
+sweep at the accepted configuration shows its last lr sweep dashed (house style).
 
 **A2 `a2_inherited_vs_retuned` — MLP tuning tracks (DEVIATIONS #12).** MLP-256 and MLP-512: per
 optimizer, final loss of the re-tuned winner vs the inherited-settings winner (seed 0, paired
-dots joined by a line), plus the LR each chose. Dumbbell plot.
+dots joined by a line). Dumbbell plot, one study per row; at the right of each row the LR each
+winner chose and, on a second line, every other hyperparameter in which the two configurations
+differ ("α 30 → 300, β₂ 0.99 → 0.95") or "other hyperparameters unchanged" — a loss gap is
+never attributed to the LR alone.
 
 **A3 `a3_robustness` — Robustness checks.** (a) Faithful-settings reruns: per study, standard
 (seed 1 fresh run) vs faithful (Muon bf16 NS, MuonAll 6-step bf16, Manifold cap 100) as paired
@@ -154,7 +195,10 @@ mean over fresh seeds.
 
 **A8 `a8_divergence` — Stability.** Per study, per optimizer: the LR range trained without
 divergence, as a horizontal span on a log2 LR axis, with the best LR marked and diverged LRs `x`.
-A study lists only the optimizers that have tuning runs in it.
+A study lists only the optimizers that have tuning runs in it. Only learning-rate divergences
+count (house style): a run that diverged in another hyperparameter's sweep is left out, and
+a footnote says so, counts those runs, and notes that the main table's divergence rate counts
+every tuning and fresh-seed run.
 
 MoE figures (expert entropy, dense-vs-MoE interaction) are not drawn until MoE fresh seeds exist;
 `figures.py` must skip them cleanly and say so on stdout.
@@ -170,4 +214,7 @@ MoE figures (expert entropy, dense-vs-MoE interaction) are not drawn until MoE f
   figure with and without Lion-Muon data; each data helper on synthetic
   frames (reuse fixtures in tests/test_analysis.py); every figure function renders on the
   synthetic fixtures without error and writes its files; markers in F5b sit exactly on the widths;
-  inherited-track rows never enter headline helpers; parked/partial runs never counted.
+  inherited-track rows never enter headline helpers; parked/partial runs never counted; the
+  last-sweep fallback and its flag when a later-tuned hyperparameter changed, divergences
+  attributed to the swept hyperparameter only, and unchanged behaviour where an
+  accepted-context sweep exists.

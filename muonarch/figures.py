@@ -19,6 +19,15 @@ Conventions that go beyond the spec text (all stated on the figures):
   (headline) runs used.  The learning-rate sweep shown for an optimizer is the
   coordinate-descent slice at exactly those accepted values: ``lr_sweep`` is a
   thin view of ``analysis._lr_sweep_rows`` (the one implementation).
+* When a hyperparameter tuned LATER in the last coordinate-descent pass
+  changed after a hyperparameter's own sweep had run, no sweep of the latter
+  exists at the accepted configuration.  The figures then draw its most
+  recent sweep, dashed, and say so (``cd_slices`` role "last",
+  ``lr_sweep_shown``); ``lr_sweep`` / ``analysis._lr_sweep_rows`` and every
+  table number are unaffected.
+* A diverged coordinate-descent run belongs to the hyperparameter whose sweep
+  it was run in (its ``cd_sweep`` label): an alpha-sweep divergence is drawn
+  in F6's alpha cell, never as a diverged learning rate.
 * The central speedup value is the geometric mean of the 3x3
   {AdamW curve seed} x {optimizer seed} matrix; the whisker is its min-max.
 """
@@ -29,6 +38,7 @@ import contextlib
 import json
 import math
 import sys
+import textwrap
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -40,6 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib import patheffects
 from matplotlib.lines import Line2D
 from matplotlib.offsetbox import (AnnotationBbox, DrawingArea, HPacker, TextArea,
                                   VPacker)
@@ -116,6 +127,11 @@ CD_HYPER_LABEL: dict[str, str] = {
     "beta2": "β₂",
     "clip": "Gradient clip",
 }
+#: Hyperparameter names in running text (legends, notes).
+CD_HYPER_TEXT: dict[str, str] = {
+    "lr": "learning rate", "wd": "weight decay", "alpha": "α",
+    "momentum": "momentum", "beta2": "β₂", "clip": "gradient clip",
+}
 #: Columns F6 draws only when the optimizer that owns them is in the figure.
 CD_HYPER_OWNER: dict[str, str] = {"alpha": "lionmuon"}
 #: Two-line column titles for the six-column F6 grid (a column is then about
@@ -189,10 +205,28 @@ def style():
         yield
 
 
+#: Filled-marker weight per optimizer: (size factor, white-edge factor).  The
+#: filled plus ``P`` has arms a third of its size, and the house white edge
+#: eats most of them at small sizes, so Lion-Muon's marker is drawn larger
+#: with a thinner edge to carry the same visual weight as the other shapes.
+MARKER_WEIGHT: dict[str, tuple[float, float]] = {"lionmuon": (1.25, 0.4)}
+
+#: Dash pattern of a sweep that is NOT at the accepted configuration (the
+#: most recent sweep of a hyperparameter, drawn because a hyperparameter
+#: tuned later changed afterwards) — the same in F5, F6 and A1.
+LAST_SWEEP_DASH = (0, (3.2, 1.6))
+
+
+def _mk(opt: str, ms: float = 6.5, mew: float = 1.0) -> dict:
+    """Marker kwargs (marker, ms, mew) of an optimizer's FILLED marker at the
+    nominal size ``ms`` / white-edge width ``mew`` (see MARKER_WEIGHT)."""
+    fs, fe = MARKER_WEIGHT.get(opt, (1.0, 1.0))
+    return {"marker": OPT_MARKER[opt], "ms": ms * fs, "mew": mew * fe}
+
+
 def _opt_handle(opt: str, line: bool = True) -> Line2D:
-    return Line2D([], [], color=OPT_COLOR[opt], marker=OPT_MARKER[opt],
-                  linestyle="-" if line else "none", lw=1.8, ms=6.5,
-                  mec="white", mew=1.0, label=OPT_LABEL[opt])
+    return Line2D([], [], color=OPT_COLOR[opt], linestyle="-" if line else "none",
+                  lw=1.8, mec="white", label=OPT_LABEL[opt], **_mk(opt, 6.5, 1.0))
 
 
 def _legend(fig, handles, ncol: int, loc: str = "outside upper center", **kw):
@@ -379,7 +413,43 @@ def accepted_config(df: pd.DataFrame, study: str, opt: str) -> dict | None:
 
 
 _SLICE_COLS = ["hyper", "value", "loss", "status", "delta", "final",
-               "accepted", "slice"]
+               "accepted", "slice", "role", "selected", "changed", "changed_text"]
+
+
+def _changed_text(pairs) -> str:
+    """'β₂ 0.99 → 0.95' for (hyper, value in the sweep, accepted value)."""
+    return ", ".join(f"{CD_HYPER_TEXT[k]} {fmt_num(a)} → {fmt_num(b)}"
+                     for k, a, b in pairs)
+
+
+def _is_later(hyper: str, other: str) -> bool:
+    """``other`` is tuned after ``hyper`` within a coordinate-descent pass."""
+    return CD_HYPERS.index(other) > CD_HYPERS.index(hyper)
+
+
+def _last_sweep_key(hyper: str, others: list[str], cells: dict, acc: dict):
+    """The context (key over ``others``) of the most recent sweep of
+    ``hyper`` when none sits at the accepted configuration, or None.
+
+    The runs carry no pass number, so "most recent" is read off the
+    configurations: the last sweep of a hyperparameter was centred on the
+    value that ended up accepted, so it must CONTAIN the accepted value
+    (completed); among those sweeps it is the one whose context differs from
+    the accepted configuration in the fewest hyperparameters (each later
+    acceptance moves the context one step further), preferring a context that
+    differs only in hyperparameters tuned later in the pass, then the lower
+    loss at the accepted value (a deterministic tie-break)."""
+    acc_key = tuple(acc[k] for k in others)
+    best = None
+    for key, cell in cells.items():
+        hit = cell.get(acc[hyper])
+        if hit is None or hit[1] != "completed":
+            continue
+        diff = [k for k, a, b in zip(others, key, acc_key) if a != b]
+        rank = (len(diff), not all(_is_later(hyper, k) for k in diff), hit[0])
+        if best is None or rank < best[0]:
+            best = (rank, key)
+    return None if best is None else best[1]
 
 
 def cd_slices(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
@@ -396,6 +466,22 @@ def cd_slices(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
     values of all other hyperparameters), accepted (final slice AND this is
     the accepted value), slice (id within the hyper; earlier-pass slices get
     their own id).  Only phase "cd" rows enter — never the inherited track.
+
+    ``role`` says how a slice is drawn: "accepted" (= final), "earlier", or
+    "last" — the most recent sweep of a hyperparameter that has NO sweep at
+    the accepted configuration, because another hyperparameter (in a
+    protocol-conforming descent: one tuned later in the last pass) changed
+    after it ran (``_last_sweep_key``).  At most one slice per hyper is
+    "accepted" or "last"; ``selected`` marks the accepted value on it (so
+    ``selected`` == ``accepted`` on a final slice), and ``changed`` names the
+    hyperparameters in which a "last" slice's context differs from the
+    accepted configuration (comma-separated, CD order; "" otherwise);
+    ``changed_text`` spells them out with the value the sweep was run at and
+    the accepted one ("β₂ 0.99 → 0.95").
+
+    A DIVERGED run belongs to the hyperparameter whose sweep it was run in:
+    with a ``cd_sweep`` label it enters the slices of that hyperparameter
+    only.
     """
     empty = pd.DataFrame(columns=_SLICE_COLS)
     if df is None or df.empty:
@@ -431,6 +517,9 @@ def cd_slices(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
             v = r[h]
             if v is None:
                 continue
+            if (r["status"] == "diverged" and r["label"] is not None
+                    and r["label"] != h):
+                continue
             if r["label"] == h:
                 swept.add(tuple(r[k] for k in others))
             cell = groups[tuple(r[k] for k in others)]
@@ -439,18 +528,117 @@ def cd_slices(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
                     or (r["status"] == "completed" and r["loss"] < cur[0])):
                 cell[v] = (r["loss"], r["status"])
         acc_key = None if acc is None else tuple(acc[k] for k in others)
+        kept = {key: cell for key, cell in groups.items()
+                if len(cell) >= 2 and not (labelled and key not in swept)}
+        last_key = None
+        if acc is not None and acc.get(h) is not None and acc_key not in kept:
+            last_key = _last_sweep_key(h, others, kept, acc)
         sid = 0
-        for key, cell in groups.items():
-            if len(cell) < 2 or (labelled and key not in swept):
-                continue
+        for key, cell in kept.items():
             final = key == acc_key
+            role = "accepted" if final else "last" if key == last_key else "earlier"
+            diff = ([] if role != "last" else
+                    [(k, a, b) for k, a, b in zip(others, key, acc_key) if a != b])
+            changed = ",".join(k for k, _, _ in diff)
+            changed_text = _changed_text(diff)
             for v, (loss, status) in sorted(cell.items()):
+                is_acc = bool(acc is not None and v == acc[h])
                 out.append({"hyper": h, "value": v, "loss": loss, "status": status,
                             "delta": loss - best, "final": final,
-                            "accepted": bool(final and acc is not None and v == acc[h]),
-                            "slice": sid})
+                            "accepted": bool(final and is_acc),
+                            "slice": sid, "role": role,
+                            "selected": bool(role != "earlier" and is_acc),
+                            "changed": changed, "changed_text": changed_text})
             sid += 1
     return pd.DataFrame(out, columns=_SLICE_COLS)
+
+
+def last_sweep_reason(pairs) -> str:
+    """Legend wording for sweeps drawn with role "last".  ``pairs``: (hyper,
+    changed) per such sweep, ``changed`` as in ``cd_slices``.  The specific
+    wording is used only when it is true of every one of them."""
+    later = all(_is_later(h, k) for h, ch in pairs for k in ch.split(",") if k)
+    return ("a hyperparameter tuned later in the pass changed afterwards" if later
+            else "another hyperparameter changed afterwards")
+
+
+def last_sweep_cells(df: pd.DataFrame, studies=None) -> pd.DataFrame:
+    """Every (study, optimizer, hyper) whose sweep is drawn with role "last"
+    (no sweep at the accepted configuration): study, optimizer, hyper,
+    accepted (the accepted value), changed, changed_text."""
+    recs = []
+    for study in (HEADLINE_STUDIES if studies is None else studies):
+        for opt in OPT_ORDER:
+            sl = cd_slices(df, study, opt)
+            g = sl[(sl["role"] == "last") & sl["selected"]]
+            for r in g.to_dict("records"):
+                recs.append({"study": study, "optimizer": opt, "hyper": r["hyper"],
+                             "accepted": r["value"], "changed": r["changed"],
+                             "changed_text": r["changed_text"]})
+    return pd.DataFrame(recs, columns=["study", "optimizer", "hyper", "accepted",
+                                       "changed", "changed_text"])
+
+
+def last_lr_sweep_label(cells: pd.DataFrame) -> str:
+    """The legend entry of a dashed (last-pass) LR sweep in F5 / A1: it names
+    the hyperparameter that changed afterwards and says the curve was run at
+    its EARLIER value, so the selected-LR marker on a dashed curve is not
+    read as the loss of the accepted configuration."""
+    what = "; ".join(dict.fromkeys(cells["changed_text"]))
+    return (f"dashed: last LR sweep, run before a later change was accepted\n"
+            f"({what}); the selected LR is marked on it, but\n"
+            f"no LR sweep exists at the accepted configuration")
+
+
+def shift_title(sel: dict) -> str:
+    """F5's shift annotation from the SELECTED learning rates per width —
+    one rule for every optimizer: "no shift" only when all are equal; the
+    overall factor ("128→512: ÷2") when the selected LR moves monotonically;
+    every step ("128→256→512: ×2, ÷2") when it does not."""
+    ws = sorted(sel)
+    if len(ws) < 2:
+        return ""
+    lrs = [sel[w] for w in ws]
+    steps = [b / a for a, b in zip(lrs, lrs[1:])]
+    same = [math.isclose(r, 1.0) for r in steps]
+    up = all(r > 1 or eq for r, eq in zip(steps, same))
+    down = all(r < 1 or eq for r, eq in zip(steps, same))
+    if all(same) or up or down:
+        return f"Selected LR, {ws[0]}→{ws[-1]}: {fmt_shift(lrs[-1] / lrs[0])}"
+    return (f"Selected LR, {'→'.join(str(w) for w in ws)}: "
+            + ", ".join("=" if eq else fmt_shift(r) for r, eq in zip(steps, same)))
+
+
+def other_sweep_divergences(df: pd.DataFrame, studies) -> pd.DataFrame:
+    """Headline tuning runs that diverged in the sweep of a hyperparameter
+    other than the learning rate (so A8 does not draw them): study,
+    optimizer, hyper, n."""
+    recs = []
+    for study in studies:
+        phases = an.headline_tuning_phases(df, study)
+        r = df[(df["study"] == study) & df["phase"].isin(phases)
+               & df["optimizer"].isin(OPT_ORDER)]
+        r = r[_swept_elsewhere(r)]
+        for (opt, lab), g in r.groupby(["optimizer", "cd_sweep"]):
+            recs.append({"study": study, "optimizer": opt,
+                         "hyper": {"beta1": "momentum"}.get(lab, lab), "n": len(g)})
+    out = pd.DataFrame(recs, columns=["study", "optimizer", "hyper", "n"])
+    if not out.empty:
+        out["_o"] = out["optimizer"].map(OPT_ORDER.index)
+        out = out.sort_values(["study", "_o"]).drop(columns="_o").reset_index(drop=True)
+    return out
+
+
+def _swept_elsewhere(rows: pd.DataFrame, hyper: str = "lr") -> pd.Series:
+    """Mask of DIVERGED coordinate-descent rows that were run in the sweep of
+    a hyperparameter other than ``hyper`` (their ``cd_sweep`` label): those
+    divergences belong to that hyperparameter, not to ``hyper``."""
+    if rows.empty or "cd_sweep" not in rows.columns:
+        return pd.Series(False, index=rows.index)
+    lab = rows["cd_sweep"].map(lambda v: {"beta1": "momentum"}.get(v, v)
+                               if isinstance(v, str) else None)
+    return ((rows["phase"] == "cd") & (rows["status"] == "diverged")
+            & lab.notna() & (lab != hyper))
 
 
 def lr_sweep(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
@@ -461,12 +649,15 @@ def lr_sweep(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
     cells at the ACCEPTED values of every other hyperparameter (so it holds
     the accepted centre, whatever ``cd_sweep`` label dedup left on it), or the
     Stage-A grid for a study without a coordinate descent.  The inherited
-    track never enters for a cd-tuned study.  Diverged cells are kept."""
+    track never enters for a cd-tuned study.  Diverged cells are kept — except
+    a divergence that was run in ANOTHER hyperparameter's sweep, which is not
+    a diverged learning rate (``_swept_elsewhere``)."""
     cols = ["lr", "loss", "status"]
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
     rows = an._lr_sweep_rows(df, study, opt, "headline")
     rows = rows[rows["status"].isin(["completed", "diverged"])]
+    rows = rows[~_swept_elsewhere(rows)]
     recs = {}
     for r in rows.to_dict("records"):
         lr = _num(r.get("lr"))
@@ -481,18 +672,46 @@ def lr_sweep(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
                          for k, v in sorted(recs.items())], columns=cols)
 
 
+def lr_sweep_shown(df: pd.DataFrame, study: str, opt: str) -> tuple[pd.DataFrame, bool]:
+    """The learning-rate sweep a figure draws, and whether it sits at the
+    accepted configuration: ``(sweep, at_accepted)``, sweep as ``lr_sweep``.
+
+    Normally this is ``lr_sweep`` itself (flag True).  When the coordinate
+    descent left NO learning-rate sweep at the accepted configuration — a
+    hyperparameter tuned later in the last pass changed after the lr sweep
+    had run, so ``lr_sweep`` holds only the stray cells that happen to share
+    the accepted context — the most recent lr sweep is returned instead (the
+    ``cd_slices`` role "last") with flag False, for the figure to draw
+    visibly distinguished.  ``analysis._lr_sweep_rows`` / ``lr_basin_width``
+    keep their accepted-context semantics; this is a figure-only view."""
+    sw = lr_sweep(df, study, opt)
+    if df is None or df.empty or not an._has_cd_rows(df, study):
+        return sw, True
+    sl = cd_slices(df, study, opt)
+    last = sl[(sl["hyper"] == "lr") & (sl["role"] == "last")]
+    if last.empty:
+        return sw, True
+    out = (last[["value", "loss", "status"]].rename(columns={"value": "lr"})
+           .sort_values("lr").reset_index(drop=True))
+    return out, False
+
+
 def earlier_pass_divergences(df: pd.DataFrame, study: str, opt: str) -> list[float]:
     """Learning rates at which a coordinate-descent run of (study, optimizer)
-    DIVERGED in a pass other than the accepted-context sweep (``lr_sweep``),
-    i.e. with other hyperparameters at pre-acceptance values.  They are not on
-    the headline curve, but they bound the stable range and must be shown."""
+    DIVERGED in a learning-rate sweep other than the one drawn
+    (``lr_sweep_shown``), i.e. with other hyperparameters at pre-acceptance
+    values.  They are not on the headline curve, but they bound the stable
+    range and must be shown.  A run that diverged in another hyperparameter's
+    sweep (e.g. Lion-Muon's alpha) is not a diverged learning rate and is
+    left to that hyperparameter's F6 cell."""
     if df is None or df.empty:
         return []
     r = df[(df["study"] == study) & (df["optimizer"] == opt) & (df["phase"] == "cd")
            & (df["status"] == "diverged")]
+    r = r[~_swept_elsewhere(r)]
     if r.empty:
         return []
-    sw = lr_sweep(df, study, opt)
+    sw, _ = lr_sweep_shown(df, study, opt)
     shown = set(sw[sw["status"] == "diverged"]["lr"])
     return sorted({v for v in (_num(x) for x in r["lr"]) if v is not None} - shown)
 
@@ -704,7 +923,11 @@ def rank_table(df: pd.DataFrame) -> pd.DataFrame:
 def track_comparison(df: pd.DataFrame) -> pd.DataFrame:
     """A2 data (seed 0): per MLP study that has BOTH tuning tracks and per
     optimizer, the re-tuned winner (the cd run at the accepted config) and the
-    inherited-settings winner (best stage_a / stage_b / edge run)."""
+    inherited-settings winner (best stage_a / stage_b / edge run).
+    ``changes`` lists every hyperparameter OTHER than the learning rate in
+    which the two winners' configurations differ, as (hyper, inherited value,
+    re-tuned value) in CD order — the loss gap between the tracks is the
+    effect of all of them together, not of the learning rate alone."""
     recs = []
     for study in MLP_STUDIES:
         for opt in OPT_ORDER:
@@ -720,13 +943,36 @@ def track_comparison(df: pd.DataFrame) -> pd.DataFrame:
             if not hit:
                 continue
             b = inh.loc[inh["final_val_loss"].idxmin()]
+            old = _hypers(b.to_dict(), opt)
             recs.append({"study": study, "optimizer": opt,
                          "retuned_loss": float(hit[0]["final_val_loss"]),
                          "retuned_lr": acc["lr"],
                          "inherited_loss": float(b["final_val_loss"]),
-                         "inherited_lr": float(b["lr"])})
+                         "inherited_lr": float(b["lr"]),
+                         "changes": tuple((k, old[k], acc[k]) for k in CD_HYPERS
+                                          if k != "lr" and old[k] != acc[k])})
     return pd.DataFrame(recs, columns=["study", "optimizer", "retuned_loss",
-                                       "retuned_lr", "inherited_loss", "inherited_lr"])
+                                       "retuned_lr", "inherited_loss", "inherited_lr",
+                                       "changes"])
+
+
+#: Short hyperparameter names of A2's "what re-tuning changed" annotation.
+A2_HYPER_TEXT: dict[str, str] = {"wd": "WD", "alpha": "α", "momentum": "momentum",
+                                 "beta2": "β₂", "clip": "clip"}
+
+
+def track_change_text(row, opt: str) -> str:
+    """A2's two-line annotation of one optimizer: the learning rate of the
+    two winners, then every other hyperparameter re-tuning changed (or that
+    none changed) — so a loss gap is never attributed to the LR alone."""
+    if math.isclose(row["inherited_lr"], row["retuned_lr"]):
+        lr = f"LR {fmt_num(row['retuned_lr'])} (both)"
+    else:
+        lr = f"LR {fmt_num(row['inherited_lr'])} → {fmt_num(row['retuned_lr'])}"
+    name = dict(A2_HYPER_TEXT, momentum="β₁" if opt == "adamw" else "momentum")
+    rest = ", ".join(f"{name[k]} {fmt_num(a)} → {fmt_num(b)}"
+                     for k, a, b in row["changes"])
+    return f"{lr}\n{rest if rest else 'other hyperparameters unchanged'}"
 
 
 def faithful_pairs(df: pd.DataFrame) -> pd.DataFrame:
@@ -786,11 +1032,14 @@ def lr_stability(df: pd.DataFrame, study: str, opt: str) -> pd.DataFrame:
     headline tuning phases, with state "ok", "high_loss" (completed but more
     than 0.5 nats above the optimizer's best — the analysis-time divergence
     criterion) or "diverged" (the run stopped), and ``best`` on the accepted
-    learning rate."""
+    learning rate.  A coordinate-descent run that diverged in the sweep of
+    another hyperparameter does not make its learning rate "diverged"
+    (``_swept_elsewhere``); it is left out here."""
     cols = ["lr", "state", "best"]
     phases = an.headline_tuning_phases(df, study)
     r = df[(df["study"] == study) & (df["optimizer"] == opt) & df["phase"].isin(phases)
            & df["status"].isin(["completed", "diverged"])]
+    r = r[~_swept_elsewhere(r)]
     if r.empty:
         return pd.DataFrame(columns=cols)
     comp = r[r["status"] == "completed"]["final_val_loss"].dropna()
@@ -1034,8 +1283,8 @@ def fig_f1(df, logs, outdir) -> list[Path]:
                 g = ok[ok["optimizer"] == opt]
                 y = pos[opt]
                 if not g.empty:
-                    ax.plot([g["loss"].mean()], [y], marker=OPT_MARKER[opt],
-                            color=OPT_COLOR[opt], ms=7.5, linestyle="none", zorder=3)
+                    ax.plot([g["loss"].mean()], [y], color=OPT_COLOR[opt],
+                            linestyle="none", zorder=3, **_mk(opt, 7.5))
                     ax.plot(g["loss"], [y + 0.33] * len(g), "o", color=OPT_COLOR[opt],
                             ms=3.4, mec="white", mew=0.5, zorder=4)
                     ax.text(0.985, y, f"{g['loss'].mean():.3f}",
@@ -1091,7 +1340,11 @@ def fig_f2(df, logs, outdir) -> list[Path]:
             for j, study in enumerate(studies):
                 ax = axes[i][j]
                 d = data[(kind, study)].set_index("optimizer")
-                pos = _opt_rows(ax, opts, labels=(j == 0))
+                # y is shared: the labels are set on every panel and hidden
+                # on all but the left one (an empty label list on one panel
+                # would blank the whole row)
+                pos = _opt_rows(ax, opts, labels=True)
+                ax.tick_params(axis="y", labelleft=(j == 0))
                 _set_log_ticks(ax, x0, x1, max_n=5)
                 ax.axvspan(x0, 1.0, color=SHADE, zorder=0, lw=0)
                 ax.axvline(1.0, color=INK2, lw=0.8, zorder=1)
@@ -1125,12 +1378,16 @@ def fig_f2(df, logs, outdir) -> list[Path]:
                         ax.plot([r["mid"]], [y], marker=OPT_MARKER[opt], mfc="white",
                                 mec=c, mew=1.6, ms=6.5, linestyle="none", zorder=3)
                     else:
-                        ax.plot([r["mid"]], [y], marker=OPT_MARKER[opt], color=c,
-                                linestyle="none", zorder=3)
+                        ax.plot([r["mid"]], [y], color=c, linestyle="none",
+                                zorder=3, **_mk(opt))
                     if np.isfinite(hi):
-                        ax.annotate(fmt_mult(r["mid"]), (end, y), xytext=(5, 0),
+                        # a thin halo keeps the label legible where the AdamW
+                        # line (a marker just left of 1) runs behind it
+                        ax.annotate(fmt_mult(r["mid"]), (end, y), xytext=(7, 0),
                                     textcoords="offset points", va="center",
-                                    ha="left", fontsize=8, color=INK)
+                                    ha="left", fontsize=8, color=INK, zorder=5,
+                                    path_effects=[patheffects.withStroke(
+                                        linewidth=2.4, foreground="white")])
                     else:
                         ax.text(r["mid"], y - 0.28, f"{fmt_mult(r['mid'])} … ∞",
                                 ha="left", va="bottom", fontsize=8, color=INK)
@@ -1138,6 +1395,8 @@ def fig_f2(df, logs, outdir) -> list[Path]:
                     _study_title(ax, study)
                 if j == 0:
                     ax.set_ylabel(rowlab, fontsize=9, fontweight="bold")
+                    for t in ax.get_yticklabels():
+                        t.set_color(INK)
         fig.supxlabel("Speedup over AdamW (×, log scale): AdamW data or FLOPs to reach "
                       "the same loss ÷ the optimizer's own", fontsize=9)
         tok = {s: data[("tokens", s)] for s in studies}
@@ -1211,8 +1470,8 @@ def fig_f3(df, logs, outdir) -> list[Path]:
                     ax.plot([mid], [L], marker=OPT_MARKER[opt], color="white", mec=c,
                             mew=1.3, ms=5.5, linestyle="none", zorder=5)
                     labels.append((opt, f"{OPT_LABEL[opt]}  {fmt_mult(mid)}"))
-                ax.plot([1.0], [L], marker=OPT_MARKER[opt], color=c, linestyle="none",
-                        ms=7, zorder=4 if opt != "adamw" else 3.5)
+                ax.plot([1.0], [L], color=c, linestyle="none",
+                        zorder=4 if opt != "adamw" else 3.5, **_mk(opt, 7))
             ax.set_xscale("log", base=2)
             ax.set_xlim(x_lo, x_hi)
             ticks = [t for t in (0.125, 0.25, 0.5, 1, 2, 4, 8) if x_lo <= t <= x_hi]
@@ -1301,9 +1560,9 @@ def _curve_figure(df, logs, outdir, stem: str, xkind: str) -> list[Path]:
                     ax.plot(g["x"] / div, g["mean"], color=OPT_COLOR[o], lw=1.8,
                             zorder=3)
                     last = g.iloc[-1]
-                    ax.plot([last["x"] / div], [last["mean"]], marker=OPT_MARKER[o],
-                            color=OPT_COLOR[o], linestyle="none", ms=5.5, mew=0.8,
-                            zorder=4, clip_on=False)
+                    ax.plot([last["x"] / div], [last["mean"]], color=OPT_COLOR[o],
+                            linestyle="none", zorder=4, clip_on=False,
+                            **_mk(o, 5.5, 0.8))
             ax0, ax1 = axes[0][j], axes[1][j]
             pad = 0.04 * (y_top - y_lo)
             ax0.set_ylim(y_lo - pad, y_top + pad)
@@ -1361,11 +1620,15 @@ def _mlp_widths(df) -> list[tuple[str, int]]:
 
 def fig_f5(df, logs, outdir) -> list[Path]:
     """F5 — loss vs learning rate per MLP width, one panel per optimizer (H4)."""
+    shown = {(s, o): lr_sweep_shown(df, s, o) for s, _ in _mlp_widths(df)
+             for o in OPT_ORDER}
     widths = [(s, w) for s, w in _mlp_widths(df)
-              if any(not lr_sweep(df, s, o).empty for o in OPT_ORDER)]
+              if any(not shown[(s, o)][0].empty for o in OPT_ORDER)]
     if not widths:
         return _skip("f5_width_transfer", "no MLP learning-rate sweeps")
-    opts = [o for o in OPT_ORDER if any(not lr_sweep(df, s, o).empty for s, _ in widths)]
+    opts = [o for o in OPT_ORDER if any(not shown[(s, o)][0].empty for s, _ in widths)]
+    last = last_sweep_cells(df, [s for s, _ in widths])
+    last = last[last["hyper"] == "lr"]
     clip = 0.15
     # up to five optimizers: one block (a row of loss panels over a row of
     # basin panels); more: two blocks, so a panel stays wide enough to read
@@ -1391,9 +1654,10 @@ def fig_f5(df, logs, outdir) -> list[Path]:
             all_lrs, sel, tops = [], {}, []
             early: set[float] = set()
             for study, w in widths:
-                sw = lr_sweep(df, study, opt)
+                sw, at_acc = shown[(study, opt)]
                 if sw.empty:
                     continue
+                ls = "-" if at_acc else LAST_SWEEP_DASH
                 c = WIDTH_COLOR.get(w, INK2)
                 ok = sw[sw["status"] == "completed"]
                 all_lrs += list(sw["lr"])
@@ -1402,14 +1666,19 @@ def fig_f5(df, logs, outdir) -> list[Path]:
                     continue
                 lmin = float(ok["loss"].min())
                 tops.append(float(ok["loss"].max()))
-                a0.plot(ok["lr"], ok["loss"], "-o", color=c, ms=4.2, mew=0.6, zorder=3)
-                a1.plot(ok["lr"], ok["loss"] - lmin, "-o", color=c, ms=4.2, mew=0.6,
-                        zorder=3)
+                a0.plot(ok["lr"], ok["loss"], ls=ls, marker="o", color=c, ms=4.2,
+                        mew=0.6, zorder=3, gid=f"sweep:{w}")
+                a1.plot(ok["lr"], ok["loss"] - lmin, ls=ls, marker="o", color=c, ms=4.2,
+                        mew=0.6, zorder=3, gid=f"sweep:{w}")
                 best_lr = an._best_lr(df, study, opt)
                 raw_lr = float(ok.loc[ok["loss"].idxmin(), "lr"])
                 hit = ok[np.isclose(ok["lr"], best_lr)] if best_lr is not None else ok.iloc[0:0]
-                if not hit.empty:
+                if best_lr is not None:
+                    # the shift annotation is computed from the SELECTED
+                    # learning rates (the fresh-seed config) for every
+                    # optimizer — never from the minimum of a drawn curve
                     sel[w] = float(best_lr)
+                if not hit.empty:
                     for ax, y in ((a0, float(hit["loss"].iloc[0])),
                                   (a1, float(hit["loss"].iloc[0]) - lmin)):
                         ax.plot([best_lr], [y], "o", color=c, ms=7.5, mec=INK, mew=1.1,
@@ -1441,13 +1710,16 @@ def fig_f5(df, logs, outdir) -> list[Path]:
             ws = sorted(sel)
             if len(ws) >= 2:
                 lo_w, hi_w = ws[0], ws[-1]
-                txt = fmt_shift(sel[hi_w] / sel[lo_w])
                 if not math.isclose(sel[hi_w], sel[lo_w]):
                     a1.annotate("", xy=(sel[hi_w], -0.017), xytext=(sel[lo_w], -0.017),
                                 arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.0,
                                                 shrinkA=0, shrinkB=0,
                                                 mutation_scale=7))
-                a1.set_title(f"{lo_w}→{hi_w}: {txt}", fontsize=8, pad=3)
+                # one line where a panel is wide enough (three per row)
+                txt = shift_title(sel)
+                if per_row > 3:
+                    txt = txt.replace("Selected LR, ", "Selected LR\n", 1)
+                a1.set_title(txt, fontsize=8, pad=3)
             if j % per_row > 0:
                 a1.tick_params(labelleft=False)
         for _, a1 in pairs[1:]:
@@ -1460,6 +1732,14 @@ def fig_f5(df, logs, outdir) -> list[Path]:
                       "a factor 2 apart)", fontsize=9)
         handles = [Line2D([], [], color=WIDTH_COLOR.get(w, INK2), marker="o", ms=4.2,
                           mew=0.6, label=STUDY_LABEL[s]) for s, w in widths]
+        if not last.empty:
+            handles.append(Line2D([], [], color=INK2, marker="o", ms=4.2, mew=0.6,
+                                  ls=LAST_SWEEP_DASH, label=last_lr_sweep_label(last)))
+            _note("f5: no LR sweep at the accepted configuration, last sweep drawn "
+                  "dashed — " + ", ".join(
+                      f"{OPT_LABEL[r['optimizer']]} {STUDY_LABEL[r['study']]} "
+                      f"(changed afterwards: {r['changed']})"
+                      for r in last.to_dict("records")))
         handles.append(Line2D([], [], marker="o", color=PALE, mec=INK, mew=1.1, ms=7.5,
                               linestyle="none", label="selected LR"))
         if any_raw:
@@ -1472,9 +1752,12 @@ def fig_f5(df, logs, outdir) -> list[Path]:
         if any_early:
             handles.append(Line2D([], [], marker="x", color=INK2, mec=INK2, ms=5,
                                   mew=1.0, linestyle="none",
-                                  label="diverged in an earlier tuning pass"))
-        _legend(fig, handles, ncol=3 if len(handles) > 5 else len(handles),
-                columnspacing=1.1)
+                                  label="LR diverged in an earlier tuning pass"))
+        if not last.empty:      # the two-line entry needs a column of its own
+            ncol = 2
+        else:
+            ncol = 3 if len(handles) > 5 else len(handles)
+        _legend(fig, handles, ncol=ncol, columnspacing=1.1)
         return _save(fig, outdir, "f5_width_transfer")
 
 
@@ -1497,8 +1780,8 @@ def build_f5b(df):
                 ax.plot(inh["width"], inh["lr"], ls=(0, (3, 2)), color=c, lw=1.4,
                         marker=mk, mfc="white", mec=c, mew=1.4, ms=11, zorder=3,
                         gid="inherited")
-            ax.plot(ret["width"], ret["lr"], "-", color=c, marker=mk, ms=6.5, zorder=4,
-                    gid="retuned")
+            ax.plot(ret["width"], ret["lr"], "-", color=c, zorder=4, gid="retuned",
+                    **_mk(opt))
             ax.set_xscale("log", base=2)
             ax.set_yscale("log", base=2)
             ax.set_xlim(min(widths) / 1.35, max(widths) * 1.35)
@@ -1534,6 +1817,30 @@ def fig_f5b(df, logs, outdir) -> list[Path]:
         return _save(fig, outdir, "f5b_optimal_lr_vs_width")
 
 
+#: Hyperparameters swept on a long log grid (>= 5 values, a factor 2-3 apart):
+#: their far ends are orders of magnitude worse than the optimum, so only the
+#: three best values of such a sweep set the row's y limit in F6.
+LOG_GRID_HYPERS: tuple[str, ...] = ("lr", "alpha")
+
+
+def f6_row_limit(sl: pd.DataFrame, thr: float) -> float:
+    """The y limit of one F6 row (one optimizer; ``sl`` = its ``cd_slices``).
+
+    Only the MAIN sweep of each hyperparameter counts (role "accepted" or
+    "last") — an earlier-pass sweep is context and never sets the scale: the
+    largest delta of the categorical sweeps (weight decay, momentum, beta2,
+    clip), the third-smallest delta of the log-grid sweeps (LOG_GRID_HYPERS),
+    and at least 2.6 x the noise threshold; times 1.22 of headroom.  Points
+    above it are drawn at the top edge as "above the axis limit"."""
+    ok = sl[(sl["status"] == "completed") & (sl["role"] != "earlier")]
+    cands = []
+    for h, g in ok.groupby("hyper"):
+        d = g["delta"].nsmallest(3) if h in LOG_GRID_HYPERS else g["delta"]
+        if not d.empty:
+            cands.append(float(d.max()))
+    return max(cands + ([2.6 * thr] if np.isfinite(thr) else []) + [1e-6]) * 1.22
+
+
 def fig_f6(df, logs, outdir, study: str) -> list[Path]:
     """F6 — coordinate-descent sensitivity grid of one study."""
     stem = f"f6_hparam_sensitivity_{study}"
@@ -1547,17 +1854,14 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
     with style():
         fig, axes = _subplots(len(opts), len(hypers),
                               (FULL_W, 1.22 * len(opts) + 1.15))
-        flags = dict(earlier=False, over=False, div=False, star=False)
+        flags = dict(earlier=False, over=False, div=False, star=False, main=False)
+        last_pairs: list[tuple[str, str]] = []
+        last_cells: dict[str, list[str]] = {}       # optimizer -> hypers
+        last_texts: list[str] = []
         for i, opt in enumerate(opts):
             sl = cd_slices(df, study, opt)
             c = OPT_COLOR[opt]
-            ok = sl[sl["status"] == "completed"]
-            base = ok[ok["hyper"] != "lr"]["delta"]
-            near = ok[(ok["hyper"] == "lr") & ok["final"]]["delta"].nsmallest(3)
-            cands = [float(base.max())] if not base.empty else []
-            if not near.empty:
-                cands.append(float(near.max()))
-            ytop = max(cands + ([2.6 * thr] if np.isfinite(thr) else []) + [1e-6]) * 1.22
+            ytop = f6_row_limit(sl, thr)
             for j, hyper in enumerate(hypers):
                 ax = axes[i][j]
                 h = sl[sl["hyper"] == hyper]
@@ -1608,21 +1912,37 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
                     ax.set_xticklabels([fmt_cat(v) for v in values])
                     ax.grid(axis="x", visible=False)
                 slices = sorted(h["slice"].unique(),
-                                key=lambda s: bool(h[h["slice"] == s]["final"].iloc[0]))
+                                key=lambda s: h[h["slice"] == s]["role"].iloc[0]
+                                != "earlier")
+                # values with an "above the axis limit" mark at the top edge: a
+                # diverged x at the same value is raised just above the frame
+                # so neither mark hides the other
+                over_x = {xmap[v] for v in h[(h["status"] == "completed")
+                                             & (h["delta"] > ytop)]["value"]}
                 for sid in slices:
                     g = h[h["slice"] == sid].sort_values("value")
-                    final = bool(g["final"].iloc[0])
+                    role = g["role"].iloc[0]
+                    # the main curve of a cell: the sweep at the accepted
+                    # configuration, or — where there is none — the most
+                    # recent sweep, dashed, with a hollow star
+                    final = role != "earlier"
                     flags["earlier"] |= not final
+                    flags["main"] |= role == "accepted"
+                    if role == "last":
+                        last_pairs.append((hyper, g["changed"].iloc[0]))
+                        last_texts.append(g["changed_text"].iloc[0])
+                        last_cells.setdefault(opt, []).append(hyper)
                     gc = g[g["status"] == "completed"]
                     xs = [xmap[v] for v in gc["value"]]
                     inr = gc["delta"] <= ytop
-                    kw = (dict(color=c, lw=1.6, zorder=3) if final
-                          else dict(color=c, lw=1.0, alpha=0.5, zorder=2))
-                    ax.plot(xs, gc["delta"], "-", **kw)
+                    kw = (dict(color=c, lw=1.6, zorder=3,
+                               ls="-" if role == "accepted" else LAST_SWEEP_DASH)
+                          if final else dict(color=c, lw=1.0, alpha=0.5, zorder=2))
+                    ax.plot(xs, gc["delta"], gid=f"sweep:{role}", **kw)
                     xi = [x for x, m in zip(xs, inr) if m]
                     if final:
-                        ax.plot(xi, gc["delta"][inr], linestyle="none",
-                                marker=OPT_MARKER[opt], color=c, ms=5, mew=0.7, zorder=4)
+                        ax.plot(xi, gc["delta"][inr], linestyle="none", color=c,
+                                zorder=4, **_mk(opt, 5, 0.7))
                     else:
                         ax.plot(xi, gc["delta"][inr], linestyle="none",
                                 marker=OPT_MARKER[opt], mfc="white", mec=c, mew=1.0,
@@ -1637,18 +1957,27 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
                     xd = [xmap[v] for v in g[g["status"] == "diverged"]["value"]]
                     if xd:
                         flags["div"] = True
-                        ax.plot(xd, [0.955] * len(xd), "x", color=INK, mec=INK, ms=5.5, mew=1.4,
-                                transform=ax.get_xaxis_transform(), zorder=6)
-                    acc = gc[gc["accepted"]]
+                        ax.plot(xd, [1.08 if x in over_x else 0.955 for x in xd], "x",
+                                color=INK, mec=INK, ms=5.5, mew=1.4, clip_on=False,
+                                transform=ax.get_xaxis_transform(), zorder=6,
+                                gid="diverged")
+                    acc = gc[gc["selected"]]
                     if final and not acc.empty:
-                        flags["star"] = True
-                        ax.plot([xmap[acc["value"].iloc[0]]],
-                                [min(float(acc["delta"].iloc[0]), ytop)], "*", color=c,
-                                mec=INK, mew=0.7, ms=11, zorder=7)
+                        xy = ([xmap[acc["value"].iloc[0]]],
+                              [min(float(acc["delta"].iloc[0]), ytop)])
+                        if role == "accepted":
+                            flags["star"] = True
+                            ax.plot(*xy, "*", color=c, mec=INK, mew=0.7, ms=11,
+                                    zorder=7, gid="star:accepted")
+                        else:       # the accepted VALUE, on a sweep run before
+                            ax.plot(*xy, "*", mfc="white", mec=c, mew=1.5, ms=14,
+                                    zorder=8, gid="star:last")
         fig.supylabel("Final validation loss − the optimizer's best "
                       "(lower is better; axis clipped per row)", fontsize=9)
-        handles = [Line2D([], [], color=PALE, marker="o", ms=5, mew=0.7, lw=1.6,
-                          label="sweep around the accepted configuration")]
+        handles = []
+        if flags["main"]:
+            handles.append(Line2D([], [], color=PALE, marker="o", ms=5, mew=0.7, lw=1.6,
+                                  label="sweep around the accepted configuration"))
         if flags["earlier"]:
             handles.append(Line2D([], [], color=PALE, marker="o", mfc="white", mec=PALE,
                                   mew=1.0, ms=4.2, lw=1.0, alpha=0.75,
@@ -1656,6 +1985,23 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
         if flags["star"]:
             handles.append(Line2D([], [], marker="*", color=PALE, mec=INK, mew=0.7,
                                   ms=11, linestyle="none", label="accepted value"))
+        if last_pairs:
+            handles.append(Line2D([], [], color=INK2, lw=1.6, ls=LAST_SWEEP_DASH,
+                                  marker="*", mfc="white", mec=INK2, mew=1.5, ms=14,
+                                  label="last sweep and accepted value where no sweep\n"
+                                        "exists at the accepted configuration (note below)"))
+            where = "; ".join(
+                f"{OPT_LABEL[o]}: {', '.join(CD_HYPER_TEXT[h] for h in hs)}"
+                for o, hs in last_cells.items())
+            note = (f"Dashed line and hollow star ({where}): "
+                    f"{last_sweep_reason(last_pairs)} "
+                    f"({'; '.join(dict.fromkeys(last_texts))}), so no sweep of "
+                    f"these hyperparameters exists at the accepted configuration. Their "
+                    f"last sweep, run at the earlier value, is drawn; the star marks "
+                    f"the accepted value on it.")
+            fig.supxlabel(textwrap.fill(note, 118), fontsize=8, color=INK2)
+            _note(f"{stem}: no sweep at the accepted configuration, last sweep drawn "
+                  f"dashed with a hollow star — {where}")
         if np.isfinite(thr):
             handles.append(Patch(facecolor=NEUTRAL, alpha=0.55, lw=0,
                                  label=f"noise: 2 × pilot seed std = {thr:.3f} "
@@ -1749,10 +2095,9 @@ def fig_f8(df, logs, outdir) -> list[Path]:
             for _, r in t.iterrows():
                 hollow = not r["separated"]
                 any_hollow |= hollow
-                ax.plot([r["x"]], [r["rank"]], marker=OPT_MARKER[opt],
-                        mfc="white" if hollow else c, mec=c if hollow else "white",
-                        mew=1.8 if hollow else 1.0, ms=8.5 if hollow else 9.5,
-                        linestyle="none", zorder=3)
+                kw = (dict(marker=OPT_MARKER[opt], mfc="white", mec=c, mew=1.8, ms=8.5)
+                      if hollow else dict(mfc=c, mec="white", **_mk(opt, 9.5)))
+                ax.plot([r["x"]], [r["rank"]], linestyle="none", zorder=3, **kw)
             last = t.iloc[-1]
             ax.annotate(OPT_LABEL[opt], (last["x"], last["rank"]), xytext=(10, 0),
                         textcoords="offset points", va="center", ha="left",
@@ -1789,14 +2134,20 @@ def fig_f8(df, logs, outdir) -> list[Path]:
 #: y clip of A1 (loss minus sweep minimum, nats): keeps the near-optimum
 #: region readable; points above it are drawn as ^ at the top edge.
 A1_CLIP = 0.3
+#: y (axes fraction) of A1's diverged marks: a rail just above the frame, so a
+#: diverged LR never hides another optimizer's "above the axis limit" mark at
+#: the same LR on the top edge (which it did at LR ÷ selected = 16).
+A1_DIV_Y = 1.045
 
 
 def fig_a1(df, logs, outdir) -> list[Path]:
     """A1 — loss vs learning rate for all optimizers (relative and raw LR)."""
     studies = [s for s in headline_studies(df)
-               if any(not lr_sweep(df, s, o).empty for o in OPT_ORDER)]
+               if any(not lr_sweep_shown(df, s, o)[0].empty for o in OPT_ORDER)]
     if not studies:
         return _skip("a1_lr_sensitivity", "no learning-rate sweeps")
+    last = last_sweep_cells(df, studies)
+    last = last[last["hyper"] == "lr"]
     with style():
         fig, axes = _subplots(2, len(studies), (FULL_W, 4.5))
         used = []
@@ -1805,7 +2156,7 @@ def fig_a1(df, logs, outdir) -> list[Path]:
             a0, a1 = axes[0][j], axes[1][j]
             rel_all, raw_all, near, curves = [], [], [], []
             for opt in OPT_ORDER:
-                sw = lr_sweep(df, study, opt)
+                sw, at_acc = lr_sweep_shown(df, study, opt)
                 best_lr = an._best_lr(df, study, opt)
                 ok = sw[sw["status"] == "completed"]
                 if ok.empty or best_lr is None:
@@ -1817,19 +2168,23 @@ def fig_a1(df, logs, outdir) -> list[Path]:
                 rel = lrs / best_lr
                 early = earlier_pass_divergences(df, study, opt)
                 div = list(sw[sw["status"] == "diverged"]["lr"])
-                curves.append((opt, lrs, d, best_lr, div, early))
+                curves.append((opt, lrs, d, best_lr, div, early, at_acc))
                 rel_all += list(sw["lr"] / best_lr) + [v / best_lr for v in early]
                 raw_all += list(sw["lr"]) + early
                 near += list(d[(rel >= 1 / 4.01) & (rel <= 4.01)])
             ytop = min(max(near + [1e-6]) * 1.2, A1_CLIP)
-            for opt, lrs, d, best_lr, div, early in curves:
-                c, mk = OPT_COLOR[opt], OPT_MARKER[opt]
+            for opt, lrs, d, best_lr, div, early, at_acc in curves:
+                c = OPT_COLOR[opt]
                 inr = d <= ytop
                 for ax, xs in ((a0, lrs / best_lr), (a1, lrs)):
                     tr = ax.get_xaxis_transform()
-                    ax.plot(xs, d, "-", color=c, zorder=3)
-                    ax.plot(xs[inr], d[inr], linestyle="none", color=c, marker=mk, ms=5,
-                            mew=0.7, zorder=4)
+                    # a dashed (last-pass) curve is drawn above the solid
+                    # ones, or a coinciding solid line hides its dashing
+                    up = 0.0 if at_acc else 1.5
+                    ax.plot(xs, d, ls="-" if at_acc else LAST_SWEEP_DASH, color=c,
+                            zorder=3 + up, gid=f"sweep:{opt}")
+                    ax.plot(xs[inr], d[inr], linestyle="none", color=c, zorder=4 + up,
+                            **_mk(opt, 5, 0.7))
                     if (~inr).any():
                         flags["over"] = True
                         ax.plot(xs[~inr], [0.955] * int((~inr).sum()), "^", color=c,
@@ -1837,12 +2192,14 @@ def fig_a1(df, logs, outdir) -> list[Path]:
                     scale = (1.0 / best_lr) if ax is a0 else 1.0
                     for lr in div:
                         flags["div"] = True
-                        ax.plot([lr * scale], [0.955], "x", color=c, mec=c, ms=6.5,
-                                mew=1.8, transform=tr, zorder=6)
+                        ax.plot([lr * scale], [A1_DIV_Y], "x", color=c, mec=c, ms=6,
+                                mew=1.6, transform=tr, zorder=6, clip_on=False,
+                                gid="diverged")
                     for lr in early:
                         flags["early"] = True
-                        ax.plot([lr * scale], [0.955], "x", color=c, mec=c, ms=6.5,
-                                mew=1.8, transform=tr, zorder=6)
+                        ax.plot([lr * scale], [A1_DIV_Y], "x", color=c, mec=c, ms=6,
+                                mew=1.6, transform=tr, zorder=6, clip_on=False,
+                                gid="diverged")
             for ax in (a0, a1):
                 ax.set_ylim(-0.04 * ytop, ytop)
                 ax.yaxis.set_major_locator(MaxNLocator(4))
@@ -1865,20 +2222,34 @@ def fig_a1(df, logs, outdir) -> list[Path]:
             if j == 0:
                 a0.set_ylabel("Loss − sweep minimum\n(lower is better)")
                 a1.set_ylabel("Loss − sweep minimum\n(lower is better)")
+        if flags["div"] or flags["early"]:     # room for the rail above the frame
+            for ax, study in zip(axes[0], studies):
+                ax.set_title(STUDY_LABEL.get(study, study), pad=13)
         handles = [_opt_handle(o) for o in used]
         if flags["over"]:
             handles.append(Line2D([], [], marker="^", color=PALE, ms=4.2, mew=0.6,
                                   linestyle="none", label="above the axis limit"))
         if flags["div"] and flags["early"]:
-            label = "diverged (this sweep or an earlier tuning pass)"
+            label = "LR diverged (this sweep or an earlier tuning pass)"
         elif flags["early"]:
-            label = "diverged in an earlier tuning pass"
+            label = "LR diverged in an earlier tuning pass"
         else:
             label = "diverged"
         if flags["div"] or flags["early"]:
-            handles.append(Line2D([], [], marker="x", color=INK2, mec=INK2, ms=6.5,
-                                  mew=1.8, linestyle="none", label=label))
-        _legend(fig, handles, ncol=4 if len(handles) > 5 else len(handles))
+            handles.append(Line2D([], [], marker="x", color=INK2, mec=INK2, ms=6,
+                                  mew=1.6, linestyle="none", label=label))
+        if not last.empty:
+            handles.append(Line2D([], [], color=INK2, lw=1.8, ls=LAST_SWEEP_DASH,
+                                  label=last_lr_sweep_label(last)))
+            _note("a1: no LR sweep at the accepted configuration, last sweep drawn "
+                  "dashed — " + ", ".join(
+                      f"{OPT_LABEL[r['optimizer']]} {STUDY_LABEL[r['study']]}"
+                      for r in last.to_dict("records")))
+        if not last.empty:
+            ncol = 3
+        else:
+            ncol = 4 if len(handles) > 5 else len(handles)
+        _legend(fig, handles, ncol=ncol)
         return _save(fig, outdir, "a1_lr_sensitivity")
 
 
@@ -1891,10 +2262,14 @@ def fig_a2(df, logs, outdir) -> list[Path]:
     studies = [s for s in MLP_STUDIES if s in set(tab["study"])]
     opts = [o for o in OPT_ORDER if o in set(tab["optimizer"])]
     with style():
-        fig, axes = _subplots(1, len(studies), (FULL_W, 2.6))
-        for j, (ax, study) in enumerate(zip(axes[0], studies)):
+        # one study per row: the annotation column at the right needs the width
+        fig, axes = _subplots(len(studies), 1, (FULL_W, 2.45 * len(studies) + 1.0))
+        for j, (ax, study) in enumerate(zip(axes[:, 0], studies)):
             t = tab[tab["study"] == study].set_index("optimizer")
-            pos = _opt_rows(ax, opts, labels=(j == 0))
+            pos = _opt_rows(ax, opts, labels=True)
+            ax.text(1.03, 1.0, "Hyperparameters, inherited → re-tuned",
+                    transform=ax.transAxes, ha="left", va="bottom", fontsize=8,
+                    color=INK2)
             vals = list(t["retuned_loss"]) + list(t["inherited_loss"])
             lo, hi = min(vals), max(vals)
             span = max(hi - lo, 1e-9)
@@ -1907,14 +2282,11 @@ def fig_a2(df, logs, outdir) -> list[Path]:
                         lw=1.6, zorder=2)
                 ax.plot([r["inherited_loss"]], [y], marker=mk, mfc="white", mec=c,
                         mew=1.4, ms=10.5, linestyle="none", zorder=3)
-                ax.plot([r["retuned_loss"]], [y], marker=mk, color=c, ms=6.5,
-                        linestyle="none", zorder=4)
-                if math.isclose(r["inherited_lr"], r["retuned_lr"]):
-                    txt = f"LR {fmt_num(r['retuned_lr'])} (both)"
-                else:
-                    txt = f"LR {fmt_num(r['inherited_lr'])} → {fmt_num(r['retuned_lr'])}"
-                ax.text(1.03, y, txt, transform=ax.get_yaxis_transform(), ha="left",
-                        va="center", fontsize=8, color=INK)
+                ax.plot([r["retuned_loss"]], [y], color=c, linestyle="none",
+                        zorder=4, **_mk(opt))
+                ax.text(1.03, y, track_change_text(r, opt),
+                        transform=ax.get_yaxis_transform(), ha="left", va="center",
+                        fontsize=8, color=INK, linespacing=1.15)
             thr = noise_threshold(df, study)
             if np.isfinite(thr):
                 x0 = lo
@@ -2086,12 +2458,13 @@ def fig_a4(df, logs, outdir) -> list[Path]:
             for opt in OPT_ORDER:
                 g = r[r["optimizer"] == opt]
                 tun, fresh = g[g["phase"] != "fresh_seed"], g[g["phase"] == "fresh_seed"]
+                big = MARKER_WEIGHT.get(opt, (1.0, 1.0))[0]
                 ax.plot(tun["final_val_loss"], 100 * tun["final_test_acc"],
                         linestyle="none", marker=OPT_MARKER[opt], color=OPT_COLOR[opt],
-                        ms=3.6, mew=0, alpha=0.38, zorder=2)
+                        ms=3.6 * big, mew=0, alpha=0.38, zorder=2)
                 ax.plot(fresh["final_val_loss"], 100 * fresh["final_test_acc"],
                         linestyle="none", marker=OPT_MARKER[opt], color=OPT_COLOR[opt],
-                        ms=4.8, mec=INK, mew=0.5, zorder=3)
+                        ms=4.8 * big, mec=INK, mew=0.5, zorder=3)
             _study_title(ax, study)
             ax.xaxis.set_major_locator(MaxNLocator(5))
         acc = runs["final_test_acc"].to_numpy(dtype=float)
@@ -2210,8 +2583,8 @@ def fig_a5(df, logs, outdir) -> list[Path]:
                 for x, opt in enumerate(opts):
                     v = sp[sp["optimizer"] == opt]["sigma"].to_numpy()
                     jit = rng.uniform(-0.24, 0.24, size=v.size)
-                    ax.plot(x + jit, v, linestyle="none", marker=OPT_MARKER[opt],
-                            color=OPT_COLOR[opt], ms=4.2, mew=0.5, alpha=0.8, zorder=3)
+                    ax.plot(x + jit, v, linestyle="none", color=OPT_COLOR[opt],
+                            alpha=0.8, zorder=3, **_mk(opt, 4.2, 0.5))
                     ax.plot([x - 0.34, x + 0.34], [np.median(v)] * 2, color=INK, lw=1.4,
                             zorder=4)
                 ax.axhline(1.0, color=INK2, lw=0.8, zorder=1)
@@ -2249,8 +2622,8 @@ def fig_a6(df, logs, outdir) -> list[Path]:
                             alpha=0.18, lw=0, zorder=2)
             ax.plot(g["x"] / 1e6, g["mean"], color=OPT_COLOR[opt], lw=1.8, zorder=3)
             ax.plot([g["x"].iloc[-1] / 1e6], [g["mean"].iloc[-1]],
-                    marker=OPT_MARKER[opt], color=OPT_COLOR[opt], linestyle="none",
-                    ms=5.5, mew=0.8, zorder=4, clip_on=False)
+                    color=OPT_COLOR[opt], linestyle="none", zorder=4, clip_on=False,
+                    **_mk(opt, 5.5, 0.8))
         ax.set_xlabel("Tokens seen (millions)")
         n_txt = seeds_text("a6_attention_logits", {
             o: int(d[d["optimizer"] == o]["n_seeds"].min()) for o in opts})
@@ -2283,8 +2656,8 @@ def fig_a7(df, logs, outdir) -> list[Path]:
         for ax, kind in zip(flat, kinds):
             for opt in opts:
                 g = sp[(sp["kind"] == kind) & (sp["optimizer"] == opt)].sort_values("layer")
-                ax.plot(g["layer"], g["sigma"], "-", color=OPT_COLOR[opt],
-                        marker=OPT_MARKER[opt], ms=5, mew=0.7, zorder=3)
+                ax.plot(g["layer"], g["sigma"], "-", color=OPT_COLOR[opt], zorder=3,
+                        **_mk(opt, 5, 0.7))
             ax.axhline(1.0, color=INK2, lw=0.8, zorder=1)
             ax.set_yscale("log")
             ax.set_title(titles.get(kind, kind))
@@ -2370,7 +2743,20 @@ def fig_a8(df, logs, outdir) -> list[Path]:
             ax.set_visible(False)
         _log_lr_axis(flat[0], all_lrs)
         flat[0].xaxis.set_minor_locator(FixedLocator([]))
-        fig.supxlabel("Learning rate (log scale)", fontsize=9)
+        for k, ax in enumerate(flat[:len(studies)]):
+            if k + ncols >= len(studies):
+                ax.set_xlabel("Learning rate (log scale)")
+        other = other_sweep_divergences(df, studies)
+        note = ("× marks only runs that diverged in a learning-rate sweep; the divergence "
+                "rate of the main table counts every tuning and fresh-seed run.")
+        if not other.empty:
+            n = int(other["n"].sum())
+            where = "; ".join(f"{OPT_LABEL[r['optimizer']]}, {STUDY_LABEL[r['study']]}, "
+                              f"{CD_HYPER_TEXT[r['hyper']]} sweep"
+                              for r in other.to_dict("records"))
+            note += (f" Not drawn: {n} run{'s' if n != 1 else ''} that diverged in "
+                     f"another hyperparameter's sweep ({where}; see F6).")
+        fig.supxlabel(textwrap.fill(note, 108), fontsize=8, color=INK2)
         handles = [
             Patch(facecolor=PALE, alpha=0.5, lw=0,
                   label="range trained without divergence (dots: tested LRs)"),
@@ -2383,7 +2769,8 @@ def fig_a8(df, logs, outdir) -> list[Path]:
                                   label="completed, but > best + 0.5 nats"))
         if flags["div"]:
             handles.append(Line2D([], [], marker="x", color=INK, mec=INK, ms=6, mew=1.5,
-                                  linestyle="none", label="diverged (run stopped)"))
+                                  linestyle="none",
+                                  label="diverged in an LR sweep (run stopped)"))
         _legend(fig, handles, ncol=2)
         return _save(fig, outdir, "a8_divergence")
 

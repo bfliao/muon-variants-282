@@ -1203,7 +1203,8 @@ def test_f5_one_block_for_five_two_rows_of_three_for_six(captured):
     # the Lion-Muon panel: one curve per width, at its own learning rates,
     # and the shift of its selected LR from 128 to 512 (0.004 -> 0.002)
     top, bottom = fig.axes[7], fig.axes[10]
-    assert top.get_title() == "Lion-Muon" and bottom.get_title() == "128→512: ÷2"
+    assert top.get_title() == "Lion-Muon"
+    assert bottom.get_title() == "Selected LR, 128→512: ÷2"
     for w, olr in ((128, 0.004), (256, 0.004), (512, 0.002)):
         xs = [olr * 0.5, olr, olr * 2]
         ln = [l for l in _lines_with_x(top, xs) if l.get_color() == fg.WIDTH_COLOR[w]]
@@ -1356,3 +1357,426 @@ def test_hand_built_frame_with_lionmuon_renders(tmp_path):
                 "a1_lr_sensitivity", "a2_inherited_vs_retuned", "a8_divergence"):
         assert res[fid], fid
     assert plt.get_fignums() == []
+
+
+# ------------- no sweep at the accepted configuration; divergence attribution
+
+LION_FINAL = dict(lr=0.004, wd=0.3, alpha=300.0, beta2=0.95)
+
+
+def _lion_late_change(study="mlp256", lr_scale=1.0, diverged_alpha=True):
+    """A two-pass Lion-Muon coordinate descent (order lr, wd, alpha, beta2,
+    clip) in which beta2 changes in pass 2, AFTER that pass's lr, wd and
+    alpha sweeps: the accepted configuration (lr 0.004, wd 0.3, alpha 300,
+    beta2 0.95, clip 1) has a beta2 and a clip sweep but no lr / wd / alpha
+    sweep.  Centre cells keep the label of the sweep that first ran them
+    (config dedup).  One run of the pass-2 ALPHA sweep diverges (alpha 3 at
+    lr 0.004)."""
+    k = lr_scale
+    R = lambda lr, loss, sweep, **kw: _row(                          # noqa: E731
+        study, "lionmuon", "cd", 0, lr * k, loss, cd_sweep=sweep,
+        **{"wd": 0.1, "alpha": 30.0, "beta2": 0.99, **kw})
+    rows = []
+    # pass 1: lr (-> 0.002), wd (-> 0.3), alpha (-> 300), beta2 (kept), clip
+    for lr, loss in ((0.001, 0.80), (0.002, 0.78), (0.004, 0.81)):
+        rows.append(R(lr, loss, "lr"))
+    for wd, loss in ((0.0, 0.79), (0.3, 0.77)):
+        rows.append(R(0.002, loss, "wd", wd=wd))
+    for a, loss in ((3.0, 0.94), (300.0, 0.756)):
+        rows.append(R(0.002, loss, "alpha", wd=0.3, alpha=a))
+    for b, loss in ((0.9, 0.774), (0.95, 0.755)):
+        rows.append(R(0.002, loss, "beta2", wd=0.3, alpha=300.0, beta2=b))
+    # pass 2: lr (-> 0.004) at wd 0.3, alpha 300, beta2 0.99
+    for lr, loss in ((0.0005, 0.84), (0.001, 0.785), (0.004, 0.748), (0.008, 0.787)):
+        rows.append(R(lr, loss, "lr", wd=0.3, alpha=300.0))
+    for wd, loss in ((0.0, 0.771), (0.1, 0.765)):
+        rows.append(R(0.004, loss, "wd", wd=wd, alpha=300.0))
+    for a, loss in ((30.0, 0.80), (100.0, 0.77)):
+        rows.append(R(0.004, loss, "alpha", wd=0.3, alpha=a))
+    if diverged_alpha:
+        rows.append(R(0.004, None, "alpha", wd=0.3, alpha=3.0, status="diverged"))
+    # beta2 0.95 accepted, after the three sweeps above; then clip
+    for b, loss in ((0.9, 0.739), (0.95, 0.732)):
+        rows.append(R(0.004, loss, "beta2", wd=0.3, alpha=300.0, beta2=b))
+    for c, loss in ((0.5, 0.736), (None, 0.729)):
+        rows.append(R(0.004, loss, "clip", wd=0.3, alpha=300.0, beta2=0.95, clip=c))
+    for seed, loss in ((1, 0.731), (2, 0.733), (3, 0.732)):
+        rows.append(_row(study, "lionmuon", "fresh_seed", seed, 0.004 * k, loss,
+                         wd=0.3, alpha=300.0, beta2=0.95))
+    return rows
+
+
+def test_last_sweep_when_a_later_tuned_hyper_changed():
+    d = _frame(_lion_late_change())
+    acc = fg.accepted_config(d, "mlp256", "lionmuon")
+    assert {k: acc[k] for k in LION_FINAL} == LION_FINAL
+    sl = fg.cd_slices(d, "mlp256", "lionmuon")
+    role = lambda h: sorted(set(sl[sl["hyper"] == h]["role"]))        # noqa: E731
+    # beta2 and clip were swept at the accepted configuration; lr, wd and
+    # alpha were not: their pass-2 sweep is "last", their pass-1 one "earlier"
+    assert role("beta2") == ["accepted", "earlier"] and role("clip") == ["accepted"]
+    for h in ("lr", "wd", "alpha"):
+        assert role(h) == ["earlier", "last"], h
+        g = sl[sl["hyper"] == h]
+        assert not g["final"].any() and not g["accepted"].any()       # unchanged cols
+        last = g[g["role"] == "last"]
+        assert last["slice"].nunique() == 1
+        assert set(last["changed"]) == {"beta2"}                      # tuned later
+        assert list(last[last["selected"]]["value"]) == [LION_FINAL[h]]
+        assert not g[g["role"] == "earlier"]["selected"].any()
+    lr = sl[(sl["hyper"] == "lr") & (sl["role"] == "last")]
+    assert list(lr["value"]) == [0.0005, 0.001, 0.002, 0.004, 0.008]   # pass 2
+    assert list(lr["loss"]) == pytest.approx([0.84, 0.785, 0.756, 0.748, 0.787])
+    # y is loss minus the optimizer's best cd loss: the curve does not reach 0
+    assert lr["delta"].min() == pytest.approx(0.748 - 0.729)
+    fin = sl[sl["role"] == "accepted"]
+    assert (fin["selected"] == fin["accepted"]).all()
+    assert sorted(fin[fin["accepted"]]["hyper"]) == ["beta2", "clip"]
+
+    # the figure-level lr sweep: the last sweep, flagged as NOT at the
+    # accepted configuration ...
+    sw, at_acc = fg.lr_sweep_shown(d, "mlp256", "lionmuon")
+    assert at_acc is False
+    assert list(sw["lr"]) == [0.0005, 0.001, 0.002, 0.004, 0.008]
+    assert list(sw.columns) == ["lr", "loss", "status"]
+    # ... while lr_sweep / analysis keep their accepted-context semantics
+    assert list(fg.lr_sweep(d, "mlp256", "lionmuon")["lr"]) == [0.002, 0.004]
+    rows = an._lr_sweep_rows(d, "mlp256", "lionmuon")
+    assert sorted(rows["lr"]) == [0.002, 0.004]
+    assert set(rows["lionmuon_beta2"]) == {0.95}
+    assert an.lr_basin_width("mlp256", "lionmuon", d, 0.01) == 0.0
+    assert an._best_lr(d, "mlp256", "lionmuon") == 0.004
+
+    cells = fg.last_sweep_cells(d, ["mlp256"])
+    assert [tuple(r) for r in cells.itertuples(index=False)] == [
+        ("mlp256", "lionmuon", "lr", 0.004, "beta2", "β₂ 0.99 → 0.95"),
+        ("mlp256", "lionmuon", "wd", 0.3, "beta2", "β₂ 0.99 → 0.95"),
+        ("mlp256", "lionmuon", "alpha", 300.0, "beta2", "β₂ 0.99 → 0.95")]
+    # the legend entry of the dashed LR sweep names what changed and says the
+    # curve was run before it
+    label = fg.last_lr_sweep_label(cells[cells["hyper"] == "lr"])
+    assert label.startswith("dashed: last LR sweep") and "β₂ 0.99 → 0.95" in label
+    assert "no LR sweep exists at the accepted configuration" in label
+    assert "tuned later in the pass" in fg.last_sweep_reason(
+        zip(cells["hyper"], cells["changed"]))
+
+
+def test_last_sweep_reason_is_specific_only_when_true():
+    # _two_pass_cd stops before re-sweeping wd: its only wd sweep ran at the
+    # pre-acceptance lr, a hyperparameter tuned EARLIER in the pass
+    d = _frame(_two_pass_cd(inherited=False))
+    sl = fg.cd_slices(d, "mlp256", "muon")
+    wd = sl[sl["hyper"] == "wd"]
+    assert set(wd["role"]) == {"last"} and set(wd["changed"]) == {"lr"}
+    assert list(wd[wd["selected"]]["value"]) == [0.03]
+    assert fg.last_sweep_reason([("wd", "lr")]) == (
+        "another hyperparameter changed afterwards")
+    assert fg.last_sweep_reason([("lr", "beta2"), ("wd", "alpha,beta2")]) == (
+        "a hyperparameter tuned later in the pass changed afterwards")
+    assert fg.last_sweep_reason([("lr", "beta2"), ("wd", "lr")]) == (
+        "another hyperparameter changed afterwards")
+
+
+def test_accepted_context_sweeps_are_unchanged():
+    # (c) where a sweep exists at the accepted configuration nothing changes
+    d = _frame(_two_pass_cd())
+    sw, at_acc = fg.lr_sweep_shown(d, "mlp256", "muon")
+    assert at_acc is True
+    pd.testing.assert_frame_equal(sw, fg.lr_sweep(d, "mlp256", "muon"))
+    sl = fg.cd_slices(d, "mlp256", "muon")
+    lr = sl[sl["hyper"] == "lr"]
+    assert set(lr[lr["final"]]["role"]) == {"accepted"}
+    assert set(lr[~lr["final"]]["role"]) == {"earlier"}
+    assert (lr["selected"] == lr["accepted"]).all() and (lr["changed"] == "").all()
+    assert fg.last_sweep_cells(d, ["mlp256"])["hyper"].tolist() == ["wd"]
+    # a study tuned without coordinate descent: the Stage-A grid, flag True
+    st = _frame([_row("dense", "muon", "stage_a", 0, lr, loss)
+                 for lr, loss in ((0.01, 4.1), (0.02, 4.0), (0.04, 4.2))]
+                + [_row("dense", "muon", "fresh_seed", s, 0.02, 4.0) for s in (1, 2, 3)])
+    sw, at_acc = fg.lr_sweep_shown(st, "dense", "muon")
+    assert at_acc is True and list(sw["lr"]) == [0.01, 0.02, 0.04]
+    assert fg.lr_sweep_shown(st, "dense", "adamw")[0].empty
+    assert fg.lr_sweep_shown(None, "dense", "muon")[0].empty
+
+
+def test_a_divergence_belongs_to_the_swept_hyperparameter():
+    d = _frame(_lion_late_change())
+    # (b) the only diverged run is in the ALPHA sweep (alpha 3 at lr 0.004):
+    # it is no diverged learning rate ...
+    assert fg.earlier_pass_divergences(d, "mlp256", "lionmuon") == []
+    assert (fg.lr_sweep_shown(d, "mlp256", "lionmuon")[0]["status"] == "completed").all()
+    st = fg.lr_stability(d, "mlp256", "lionmuon").set_index("lr")
+    assert "diverged" not in set(st["state"])
+    assert st.loc[0.004, "state"] == "ok" and bool(st.loc[0.004, "best"])
+    sl = fg.cd_slices(d, "mlp256", "lionmuon")
+    assert set(sl[sl["status"] == "diverged"]["hyper"]) == {"alpha"}
+    # ... it is a diverged alpha, on the last alpha sweep (F6's alpha cell)
+    div = sl[sl["status"] == "diverged"]
+    assert list(div["value"]) == [3.0] and set(div["role"]) == {"last"}
+    # the same frame without it: nothing else moves
+    d0 = _frame(_lion_late_change(diverged_alpha=False))
+    pd.testing.assert_frame_equal(st.reset_index(),
+                                  fg.lr_stability(d0, "mlp256", "lionmuon"))
+    # a divergence run in an LR sweep stays a diverged learning rate
+    rows = _lion_late_change()
+    rows.append(_row("mlp256", "lionmuon", "cd", 0, 0.016, None, wd=0.1, alpha=30.0,
+                     beta2=0.99, cd_sweep="lr", status="diverged"))
+    d1 = _frame(rows)
+    assert fg.earlier_pass_divergences(d1, "mlp256", "lionmuon") == [0.016]
+    st1 = fg.lr_stability(d1, "mlp256", "lionmuon").set_index("lr")
+    assert st1.loc[0.016, "state"] == "diverged" and st1.loc[0.004, "state"] == "ok"
+    lr1 = fg.cd_slices(d1, "mlp256", "lionmuon")
+    lr1 = lr1[(lr1["hyper"] == "lr") & (lr1["status"] == "diverged")]
+    assert list(lr1["value"]) == [0.016] and set(lr1["role"]) == {"earlier"}
+    # ... and so does one in the sweep that is drawn (not reported twice)
+    rows.append(_row("mlp256", "lionmuon", "cd", 0, 0.016, None, wd=0.3, alpha=300.0,
+                     beta2=0.99, cd_sweep="lr", status="diverged"))
+    d2 = _frame(rows)
+    sw = fg.lr_sweep_shown(d2, "mlp256", "lionmuon")[0]
+    assert list(sw[sw["status"] == "diverged"]["lr"]) == [0.016]
+    assert fg.earlier_pass_divergences(d2, "mlp256", "lionmuon") == []
+    # unlabelled frames and non-cd phases keep every divergence (as before)
+    old = _frame(_two_pass_cd(inherited=False))
+    assert fg.lr_stability(old, "mlp256", "muon").set_index("lr").loc[
+        0.08, "state"] == "diverged"
+    assert not fg._swept_elsewhere(old).any()
+    assert fg._swept_elsewhere(d).sum() == 1
+
+
+def test_f6_row_limit_ignores_earlier_passes_and_far_log_grid_values():
+    mk = lambda h, v, delta, role: {                                 # noqa: E731
+        "hyper": h, "value": v, "loss": 1 + delta, "status": "completed",
+        "delta": delta, "final": role == "accepted", "accepted": False, "slice": 0,
+        "role": role, "selected": False, "changed": ""}
+    rows = [mk("lr", v, dl, "accepted") for v, dl in
+            ((1, 0.5), (2, 0.04), (4, 0.0), (8, 0.02), (16, 0.9))]
+    rows += [mk("alpha", v, dl, "last") for v, dl in
+             ((3, 0.3), (30, 0.05), (100, 0.01), (300, 0.0))]
+    rows += [mk("wd", v, dl, "accepted") for v, dl in ((0, 0.03), (1, 0.06))]
+    rows += [mk("wd", v, dl, "earlier") for v, dl in ((0, 0.5), (1, 0.7))]
+    sl = pd.DataFrame(rows)
+    # third-smallest of lr (0.04) and alpha (0.05), all of wd's main sweep
+    # (0.06); the earlier wd sweep (0.7) and the far lr / alpha values do not
+    # set the scale
+    assert fg.f6_row_limit(sl, math.nan) == pytest.approx(0.06 * 1.22)
+    assert fg.f6_row_limit(sl, 0.1) == pytest.approx(0.26 * 1.22)      # noise floor
+    assert fg.f6_row_limit(sl[sl["hyper"] == "alpha"], math.nan) == pytest.approx(
+        0.05 * 1.22)
+    assert fg.f6_row_limit(sl.iloc[0:0], math.nan) == pytest.approx(1.22e-6)
+
+
+def test_figures_draw_the_last_sweep_dashed(captured):
+    rows = _lion_late_change("mlp256")
+    rows += _lion_late_change("mlp512", lr_scale=0.5)
+    # mlp128: an ordinary sweep at the accepted configuration (lr 0.002)
+    for kk, off in ((0.5, 0.03), (1, 0.0), (2, 0.02)):
+        rows.append(_row("mlp128", "lionmuon", "cd", 0, 0.002 * kk, 0.86 + off,
+                         cd_sweep="lr"))
+    for seed in (1, 2, 3):
+        rows.append(_row("mlp128", "lionmuon", "fresh_seed", seed, 0.002, 0.86))
+    for study in ("mlp128", "mlp256", "mlp512"):
+        rows += [_row(study, "lionmuon", "pilot", s, 0.002, 0.9 + 0.001 * s)
+                 for s in (11, 12, 13)]
+    d = _frame(rows)
+    dash = fg.LAST_SWEEP_DASH
+    is_dashed = lambda l: l.get_linestyle() == "--" or l._dash_pattern[1] is not None  # noqa: E731,E501
+
+    # F6: dashed main curve + hollow star in the lr / wd / alpha cells, solid
+    # curve + filled star in beta2 / clip; the alpha divergence is an x there
+    fg.fig_f6(d, None, None, "mlp256")
+    fig = captured.pop("f6_hparam_sensitivity_mlp256")
+    cols = fg.f6_columns(["lionmuon"])
+    cell = {h: fig.axes[j] for j, h in enumerate(cols)}
+    for h in ("lr", "wd", "alpha"):
+        gids = [l.get_gid() for l in cell[h].get_lines()]
+        assert "sweep:last" in gids and "sweep:accepted" not in gids, h
+        assert "star:last" in gids and "star:accepted" not in gids, h
+        star = [l for l in cell[h].get_lines() if l.get_gid() == "star:last"][0]
+        assert star.get_markerfacecolor() == "white"                  # hollow
+        last = [l for l in cell[h].get_lines() if l.get_gid() == "sweep:last"][0]
+        assert is_dashed(last)
+    star = [l for l in cell["lr"].get_lines() if l.get_gid() == "star:last"][0]
+    assert list(star.get_xdata()) == [0.004]                          # accepted lr
+    assert list(star.get_ydata()) == pytest.approx([0.748 - 0.729])   # not at 0
+    for h in ("beta2", "clip"):
+        gids = [l.get_gid() for l in cell[h].get_lines()]
+        assert "star:accepted" in gids and "star:last" not in gids, h
+        main = [l for l in cell[h].get_lines() if l.get_gid() == "sweep:accepted"][0]
+        assert not is_dashed(main)
+    xs = [l for ax in fig.axes for l in ax.get_lines() if l.get_gid() == "diverged"]
+    assert len(xs) == 1 and xs[0].axes is cell["alpha"]
+    assert list(xs[0].get_xdata()) == [3.0]
+    labels = " ".join(_legend_labels(fig))
+    assert "no sweep" in labels and "accepted value" in labels
+    note = fig._supxlabel.get_text()
+    assert "Lion-Muon: learning rate, weight decay, α" in note.replace("\n", " ")
+    assert "β₂" in note and "tuned later in the pass" in note.replace("\n", " ")
+
+    # F5: dashed curves for the two widths without an accepted-context sweep,
+    # a solid one for mlp128; the shift is stated from the SELECTED LRs
+    fg.fig_f5(d, None, None)
+    fig = captured.pop("f5_width_transfer")
+    top, bottom = fig.axes[0], fig.axes[1]
+    by_w = {l.get_gid(): l for l in top.get_lines()
+            if (l.get_gid() or "").startswith("sweep:")}
+    assert not is_dashed(by_w["sweep:128"])
+    assert is_dashed(by_w["sweep:256"]) and is_dashed(by_w["sweep:512"])
+    assert list(by_w["sweep:256"].get_xdata()) == [0.0005, 0.001, 0.002, 0.004, 0.008]
+    assert list(by_w["sweep:512"].get_xdata()) == pytest.approx(
+        [0.00025, 0.0005, 0.001, 0.002, 0.004])
+    # selected LRs 0.002, 0.004, 0.002: not "no shift" — every step is named
+    assert bottom.get_title() == "Selected LR, 128→256→512: ×2, ÷2"
+    labels = _legend_labels(fig)
+    dashed = [l for l in labels if l.startswith("dashed: last LR sweep")]
+    assert len(dashed) == 1 and "β₂ 0.99 → 0.95" in dashed[0]
+    assert not any("diverged" in l for l in labels)       # no LR diverged anywhere
+    assert not [l for ax in fig.axes for l in ax.get_lines() if l.get_marker() == "x"]
+
+    # A1: the same sweeps, dashed, and no diverged mark from the alpha sweep
+    fg.fig_a1(d, None, None)
+    fig = captured.pop("a1_lr_sensitivity")
+    styles = [is_dashed([l for l in ax.get_lines()
+                         if l.get_gid() == "sweep:lionmuon"][0]) for ax in fig.axes[:3]]
+    assert styles == [False, True, True]
+    assert any(l.startswith("dashed: last LR sweep") and "β₂ 0.99 → 0.95" in l
+               for l in _legend_labels(fig))
+    assert not [l for ax in fig.axes for l in ax.get_lines() if l.get_gid() == "diverged"]
+    # the dashed curve is drawn above every solid one (its dashing stays visible)
+    for ax in fig.axes[1:3]:
+        sw = {l.get_gid(): l.get_zorder() for l in ax.get_lines()
+              if (l.get_gid() or "").startswith("sweep:")}
+        assert sw["sweep:lionmuon"] == max(sw.values())
+
+    # A8: the alpha divergence is not a diverged learning rate
+    fg.fig_a8(d, None, None)
+    fig = captured.pop("a8_divergence")
+    assert not [l for ax in fig.axes for l in ax.get_lines() if l.get_marker() == "x"]
+    assert not any("diverged" in l for l in _legend_labels(fig))
+    # ... and the figure says which divergences it shows and which it does not
+    note = fig._supxlabel.get_text().replace("\n", " ")
+    assert "only runs that diverged in a learning-rate sweep" in note
+    assert "main table counts every tuning and fresh-seed run" in note
+    assert "Not drawn: 2 runs" in note and "Lion-Muon, MLP-256, α sweep" in note
+    other = fg.other_sweep_divergences(d, ["mlp128", "mlp256", "mlp512"])
+    assert [tuple(r) for r in other.itertuples(index=False)] == [
+        ("mlp256", "lionmuon", "alpha", 1), ("mlp512", "lionmuon", "alpha", 1)]
+
+
+def test_no_dashes_or_notes_without_a_late_change(df, lion_df, captured):
+    for fn, stem in ((lambda: fg.fig_f6(df, None, None, "mlp128"),
+                      "f6_hparam_sensitivity_mlp128"),
+                     (lambda: fg.fig_a1(df, None, None), "a1_lr_sensitivity"),
+                     (lambda: fg.fig_f5(df, None, None), "f5_width_transfer")):
+        fn()
+        fig = captured.pop(stem)
+        assert not any("dashed" in l or "no sweep" in l for l in _legend_labels(fig))
+        gids = {l.get_gid() for ax in fig.axes for l in ax.get_lines()}
+        assert "sweep:last" not in gids and "star:last" not in gids
+        assert fig._supxlabel is None or "Dashed" not in fig._supxlabel.get_text()
+    assert fg.last_sweep_cells(df).empty
+    # the synthetic Lion-Muon descent is a single pass: its wd and alpha
+    # sweeps ran before alpha / beta2 moved, its lr sweep at the accepted
+    # configuration
+    cells = fg.last_sweep_cells(lion_df)
+    assert [tuple(r)[:5] for r in cells.itertuples(index=False)] == [
+        ("mlp128", "lionmuon", "wd", 0.03, "alpha,beta2"),
+        ("mlp128", "lionmuon", "alpha", 100.0, "beta2")]
+    assert fg.lr_sweep_shown(lion_df, "mlp128", "lionmuon")[1] is True
+
+
+def test_lionmuon_marker_is_drawn_heavier():
+    base, lion = fg._mk("muon", 5, 0.7), fg._mk("lionmuon", 5, 0.7)
+    assert base == {"marker": "s", "ms": 5, "mew": 0.7}
+    assert lion["marker"] == "P" and lion["ms"] > 5 and lion["mew"] < 0.7
+    assert set(fg.MARKER_WEIGHT) == {"lionmuon"}
+    h = fg._opt_handle("lionmuon")
+    assert h.get_markersize() > fg._opt_handle("adamw").get_markersize()
+
+
+def test_f2_names_its_rows_on_the_left_panels(lion_df, captured):
+    fg.fig_f2(lion_df, None, None)
+    fig = captured.pop("f2_speedup")
+    fig.canvas.draw()
+    ncol = len(fig.axes) // 2
+    for i, ax in enumerate(fig.axes):
+        shown = [t.get_text() for t in ax.get_yticklabels() if t.get_visible()]
+        if i % ncol == 0:
+            assert shown and set(shown) <= set(SIX_LABELS)
+            assert shown[0] == "AdamW"
+        else:
+            assert shown == []
+
+
+def test_shift_title_is_one_rule_for_all_optimizers():
+    t = fg.shift_title
+    assert t({128: 0.005, 256: 0.005, 512: 0.005}) == "Selected LR, 128→512: no shift"
+    assert t({128: 0.001, 256: 0.001, 512: 0.0005}) == "Selected LR, 128→512: ÷2"
+    assert t({128: 0.001, 256: 0.002, 512: 0.004}) == "Selected LR, 128→512: ×4"
+    # non-monotonic: equal end points are NOT "no shift"
+    assert t({128: 0.002, 256: 0.004, 512: 0.002}) == "Selected LR, 128→256→512: ×2, ÷2"
+    assert t({128: 0.004, 256: 0.001, 512: 0.002}) == "Selected LR, 128→256→512: ÷4, ×2"
+    assert t({128: 0.002, 512: 0.004}) == "Selected LR, 128→512: ×2"
+    assert t({256: 0.002}) == "" and t({}) == ""
+
+
+def test_main_table_prints_no_basin_without_an_accepted_lr_sweep(tmp_path):
+    late = _frame(_lion_late_change("mlp256"))
+    # the stray cells at the accepted context give lr_basin_width a number ...
+    assert an.lr_basin_width("mlp256", "lionmuon", late, 0.01) == 0.0
+    # ... but none of them was run in an lr sweep: it is not a measurement
+    assert an.has_accepted_lr_sweep(late, "mlp256", "lionmuon") is False
+    text = an.main_table(late, tmp_path / "late").read_text()
+    row = [l for l in text.splitlines() if l.startswith("| Lion-Muon |")]
+    assert len(row) == 1
+    cells = [c.strip() for c in row[0].strip("|").split("|")]
+    assert cells[4] == "—" + an.NO_SWEEP_MARK
+    notes = [l for l in text.splitlines() if l.startswith(an.NO_SWEEP_MARK)]
+    assert len(notes) == 1
+    assert "no learning-rate sweep exists at the accepted configuration" in notes[0]
+    assert "tuned later in the pass changed afterwards" in notes[0]
+    # a real sweep at the accepted context keeps its number and gets no mark
+    real = _frame(_two_pass_cd(inherited=False))
+    assert an.has_accepted_lr_sweep(real, "mlp256", "muon") is True
+    text = an.main_table(real, tmp_path / "real").read_text()
+    row = [l for l in text.splitlines() if l.startswith(("| Muon |", "| **Muon** |"))]
+    cells = [c.strip() for c in row[0].strip("|").split("|")]
+    assert cells[4] == f"{an.lr_basin_width('mlp256', 'muon', real, 0.01):.2f}"
+    assert an.NO_SWEEP_MARK not in text
+    # unlabelled frames and Stage-A studies are always sweeps
+    rows = _two_pass_cd(inherited=False)
+    for r in rows:
+        r["cd_sweep"] = None
+    assert an.has_accepted_lr_sweep(_frame(rows), "mlp256", "muon") is True
+    assert an.has_accepted_lr_sweep(real, "mlp256", "adamw") is True       # no rows
+    # the figure rule and the table rule agree
+    assert fg.lr_sweep_shown(late, "mlp256", "lionmuon")[1] is False
+    assert fg.lr_sweep_shown(real, "mlp256", "muon")[1] is True
+
+
+def test_table_and_figures_share_order_and_labels():
+    assert an.TABLE_ORDER == fg.OPT_ORDER
+    assert an.OPTIMIZER_LABEL == fg.OPT_LABEL
+
+
+def test_a2_annotation_names_every_changed_hyperparameter():
+    rows = _lion_late_change("mlp256")
+    # inherited track: MLP-128 settings (alpha 30, beta2 0.99) + LR x WD grid
+    for lr, loss in ((0.001, 0.795), (0.002, 0.782), (0.004, 0.814)):
+        rows.append(_row("mlp256", "lionmuon", "stage_a", 0, lr, loss, wd=0.1))
+    rows.append(_row("mlp256", "lionmuon", "stage_b", 0, 0.002, 0.774, wd=0.3))
+    tab = fg.track_comparison(_frame(rows))
+    r = tab.iloc[0]
+    assert (r["inherited_lr"], r["retuned_lr"]) == (0.002, 0.004)
+    assert r["changes"] == (("alpha", 30.0, 300.0), ("beta2", 0.99, 0.95))
+    assert fg.track_change_text(r, "lionmuon") == (
+        "LR 0.002 → 0.004\nα 30 → 300, β₂ 0.99 → 0.95")
+    # same LR, other hyperparameters re-tuned: still spelled out
+    r2 = fg.track_comparison(_frame(_two_pass_cd(inherited=True))).iloc[0]
+    assert r2["changes"] == (("wd", 0.003, 0.03),)
+    assert fg.track_change_text(r2, "muon") == "LR 0.0014 → 0.02\nWD 0.003 → 0.03"
+    same = dict(inherited_lr=0.001, retuned_lr=0.001, changes=())
+    assert fg.track_change_text(same, "adamw") == (
+        "LR 0.001 (both)\nother hyperparameters unchanged")
+    mom = dict(inherited_lr=0.001, retuned_lr=0.001, changes=(("momentum", 0.9, 0.8),))
+    assert fg.track_change_text(mom, "adamw").endswith("β₁ 0.9 → 0.8")
+    assert fg.track_change_text(mom, "muon").endswith("momentum 0.9 → 0.8")
