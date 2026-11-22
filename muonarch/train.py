@@ -613,6 +613,7 @@ def run(cfg: dict, root: Path | str, device: str | torch.device | None = None,
     clip = cfg.get("grad_clip")
     threshold = divergence_threshold(cfg, model)
     is_manifold = cfg["optimizer"] == "manifold"
+    is_lionmuon = cfg["optimizer"] == "lionmuon"
 
     # ---- branch resume -------------------------------------------------
     start_step = 0
@@ -654,6 +655,15 @@ def run(cfg: dict, root: Path | str, device: str | torch.device | None = None,
         msign_steps = cfg["manifold"].get("msign_steps", 10)
         opt_overhead = flops_mod.optimizer_flops_per_step(
             [], [p.numel() for p in model.parameters()], "adamw")
+        static_opt_fl = None
+    elif is_lionmuon:
+        # two step types, charged per step from what the optimizer reports
+        # it did (LionMuon.last_step_muon) — never a per-step average
+        lion_muon_fl = flops_mod.optimizer_flops_per_step(
+            muon_mats, vec_sizes, "lionmuon", ns_steps=cfg["ns_steps"],
+            muon_step=True)
+        lion_sign_fl = flops_mod.optimizer_flops_per_step(
+            muon_mats, vec_sizes, "lionmuon", muon_step=False)
         static_opt_fl = None
     else:
         static_opt_fl = flops_mod.optimizer_flops_per_step(
@@ -739,8 +749,12 @@ def run(cfg: dict, root: Path | str, device: str | torch.device | None = None,
                         opt, stats["msign_calls"], msign_steps)
 
             flops_total["model"] += model_fl_step
-            flops_total["optimizer"] += (
-                opt_overhead + step_manifold_fl if is_manifold else static_opt_fl)
+            if is_lionmuon:
+                flops_total["optimizer"] += (
+                    lion_muon_fl if opts[0].last_step_muon else lion_sign_fl)
+            else:
+                flops_total["optimizer"] += (
+                    opt_overhead + step_manifold_fl if is_manifold else static_opt_fl)
 
             loss_item = float(loss.detach())
             w_losses.append(loss_item)

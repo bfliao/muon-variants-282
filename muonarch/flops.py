@@ -55,6 +55,7 @@ __all__ = [
     "attn_flops",
     "lm_flops_per_step",
     "optimizer_flops_per_step",
+    "lionmuon_optimizer_flops",
     "break_even_ratio",
     "verify_against_counter",
 ]
@@ -118,6 +119,7 @@ def optimizer_flops_per_step(
     ns_steps: int = 5,
     msign_steps: int = 10,
     msign_calls: float | None = None,
+    muon_step: bool | None = None,
 ) -> int:
     """Optimizer FLOPs for one step.
 
@@ -130,6 +132,12 @@ def optimizer_flops_per_step(
       where ``msign_calls`` is the per-matrix mean count of msign invocations
       the optimizer reported (REQUIRED; DEVIATIONS.md #7), plus the
       ~10 FLOPs/param term.
+    - "lionmuon": ``muon_step`` is REQUIRED (which kind of step this is).
+      A Muon step (True) costs exactly what Moonlight's step costs on the
+      same shapes — NS on every matrix plus the ~10 FLOPs/param term; a sign
+      step (False) costs the ~10 FLOPs/param term only (EMA, sign and the
+      update are elementwise). Never averaged over the period here; a run
+      total is ``lionmuon_optimizer_flops``.
     """
     muon_shapes = list(muon_shapes)
     n_params = sum(int(m) * int(n) for m, n in muon_shapes) + sum(vec_sizes)
@@ -147,7 +155,36 @@ def optimizer_flops_per_step(
         return round(msign_calls * per_call) + overhead
     if optimizer == "adamw":
         return overhead
+    if optimizer == "lionmuon":
+        if muon_step is None:
+            raise ValueError(
+                "lionmuon FLOPs require muon_step (True: Newton-Schulz step, "
+                "False: sign step); the two step types are never averaged"
+            )
+        if muon_step:
+            return sum(ns_matrix_flops(s, ns_steps) for s in muon_shapes) + overhead
+        return overhead
     raise ValueError(f"unknown optimizer {optimizer!r}")
+
+
+def lionmuon_optimizer_flops(
+    muon_shapes: Iterable[Sequence[int]],
+    vec_sizes: Iterable[int],
+    n_steps: int,
+    period: int,
+    ns_steps: int = 5,
+) -> int:
+    """Exact Lion-Muon optimizer FLOPs of a run of ``n_steps`` steps started
+    at step 0: the Muon steps are t = 0, period, 2*period, ... < n_steps,
+    i.e. ceil(n_steps / period) of them, each at the Muon-step cost; every
+    other step at the sign-step cost."""
+    muon_shapes, vec_sizes = list(muon_shapes), list(vec_sizes)
+    n_muon = -(-n_steps // period)
+    muon_fl = optimizer_flops_per_step(
+        muon_shapes, vec_sizes, "lionmuon", ns_steps=ns_steps, muon_step=True)
+    sign_fl = optimizer_flops_per_step(
+        muon_shapes, vec_sizes, "lionmuon", muon_step=False)
+    return n_muon * muon_fl + (n_steps - n_muon) * sign_fl
 
 
 def break_even_ratio(model_flops_per_step: float, optimizer_flops_per_step: float) -> float:

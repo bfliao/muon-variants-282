@@ -19,7 +19,7 @@ import math
 
 import torch
 
-__all__ = ["NS_COEFFS", "ns", "ns_vec", "scale", "MuonFamily"]
+__all__ = ["NS_COEFFS", "ns", "ns_vec", "scale", "MuonFamily", "LionMuon"]
 
 NS_COEFFS: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
 
@@ -150,6 +150,116 @@ class MuonFamily(torch.optim.Optimizer):
         return loss
 
 
+class LionMuon(torch.optim.Optimizer):
+    """Lion-Muon: a Muon step every ``period`` steps, a Lion (sign) step
+    otherwise, on ONE shared EMA buffer (reference: brain-lab-research/
+    lion-muon @ e9077a8, ``src/optim/lion_muon.py``, Algorithm 1 — single
+    process, non-adaptive, ``nesterov=False``; vendored unmodified under
+    third_party/lion_muon/ as the test oracle, never a dependency).
+
+    Per matrix, with EMA buffer m (zeros at start) and step counter t = 0, 1, ...
+
+        u = beta1 * m + (1 - beta1) * g
+        t % period == 0:  u = ns(u) * scale(shape, "moonlight"),  eta = lr
+        otherwise:        u = sign(u),                            eta = lr / alpha
+        p *= 1 - eta * wd (decoupled, with THIS step's eta);  p -= eta * u
+        m = beta2 * m + (1 - beta2) * g
+
+    so step 0 is a Muon step. Newton-Schulz and the Moonlight scale are the
+    Muon family's shared ``ns`` / ``scale`` (one NS code path); stacked
+    (k, m, n) expert tensors are k independent matrices, as in MuonFamily.
+
+    * The sign-step rate follows the lr schedule: the group stores the RATIO
+      ``sign_lr_ratio`` = 1 / alpha and the sign rate is derived from the
+      group's CURRENT ``lr`` inside ``step()`` (train.py's scheduler rewrites
+      only ``group["lr"]``).
+    * The step counter lives in the per-parameter ``state`` ("step"), so
+      ``state_dict()`` carries it across checkpoint save/restore. It is
+      advanced for EVERY managed parameter on every ``step()`` call — also
+      for one without a gradient this step — so it is the reference's single
+      global counter: all parameters take their Muon steps together. A
+      parameter without a gradient is otherwise left untouched (no update, no
+      decay, buffer unchanged), exactly like MuonFamily.
+    * ``last_step_muon`` reports whether the latest ``step()`` call was a
+      Muon step (None before the first call); train.py's FLOP accounting
+      reads it, so the recorded optimizer FLOPs count the Muon steps actually
+      taken.
+
+    Matrices only (ndim >= 2): 1-D parameters belong to the AdamW group.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        wd: float = 0.0,
+        alpha: float = 30.0,
+        beta1: float = 0.9,
+        beta2: float = 0.99,
+        period: int = 5,
+        ns_steps: int = 5,
+        ns_dtype: torch.dtype = torch.float32,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if wd < 0.0:
+            raise ValueError(f"Invalid weight decay: {wd}")
+        if not alpha > 0.0:
+            raise ValueError(f"Invalid alpha (lr / sign-step lr): {alpha}")
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError(f"Invalid beta1: {beta1}")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError(f"Invalid beta2: {beta2}")
+        if int(period) != period or period < 1:
+            raise ValueError(f"Invalid period: {period}")
+        defaults = dict(
+            lr=lr, wd=wd, sign_lr_ratio=1.0 / alpha, beta1=beta1, beta2=beta2,
+            period=int(period), ns_steps=ns_steps, ns_dtype=ns_dtype,
+        )
+        super().__init__(params, defaults)
+        self.last_step_muon: bool | None = None
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        took_muon = False
+        for g in self.param_groups:
+            beta1, beta2 = g["beta1"], g["beta2"]
+            for p in g["params"]:
+                state = self.state[p]
+                t = state.get("step", 0)
+                state["step"] = t + 1          # global counter, see docstring
+                is_muon = t % g["period"] == 0
+                took_muon = took_muon or is_muon
+                if p.grad is None:
+                    continue
+                if p.ndim < 2:
+                    raise ValueError(
+                        "LionMuon handles matrices only (ndim >= 2); got a "
+                        f"parameter of shape {tuple(p.shape)}")
+                if "exp_avg" not in state:
+                    state["exp_avg"] = torch.zeros_like(p)
+                m = state["exp_avg"]
+                grad = p.grad
+                u = m * beta1 + grad * (1 - beta1)
+                if is_muon:
+                    u = ns(u, steps=g["ns_steps"], dtype=g["ns_dtype"]) * scale(
+                        p.shape, "moonlight"
+                    )
+                    step_lr = g["lr"]
+                else:
+                    u = torch.sign(u)
+                    step_lr = g["lr"] * g["sign_lr_ratio"]
+                p.mul_(1 - step_lr * g["wd"])
+                p.add_(u.to(p.dtype), alpha=-step_lr)
+                m.mul_(beta2).add_(grad, alpha=1 - beta2)
+        self.last_step_muon = took_muon
+        return loss
+
+
 # ---------------------------------------------------------------------------
 # Parameter groups + optimizer construction (design.md section 3.1, Protocol
 # "Optimizers and parameter groups" table; appended at Gate 1).
@@ -258,7 +368,7 @@ def split_params(model, optimizer: str, arch: str) -> "ParamGroups":
     """Protocol parameter-group table, verbatim.
 
     adamw                   -> everything in the adamw group.
-    muon/moonlight/manifold -> muon: attention q/k/v/o, dense SwiGLU
+    muon/moonlight/manifold/lionmuon -> muon: attention q/k/v/o, dense SwiGLU
         gate/up/down, each MoE expert's gate/up/down separately, MLP input
         and hidden matrices; adamw: embeddings/tied head (once), CIFAR
         classifier, all norms incl. QK-norm gains, all biases, MoE router.
@@ -269,7 +379,8 @@ def split_params(model, optimizer: str, arch: str) -> "ParamGroups":
     Raises on unknown names (nothing is silently dropped) and verifies the
     split is complete and disjoint.
     """
-    if optimizer not in ("adamw", "muon", "moonlight", "manifold", "muonall"):
+    if optimizer not in ("adamw", "muon", "moonlight", "manifold", "muonall",
+                         "lionmuon"):
         raise ValueError(f"Unknown optimizer: {optimizer!r}")
     if arch not in ("mlp", "dense", "moe"):
         raise ValueError(f"Unknown arch: {arch!r}")
@@ -321,7 +432,10 @@ def build_optimizers(cfg: dict, model) -> tuple:
     Gate-0 answer 12: in Muon AND Manifold runs the AdamW group uses
     cfg["adamw_group_lr"] AND cfg["adamw_group_wd"] (= AdamW's tuned values
     for that study); the optimizer's own tuned wd applies to its Muon group
-    only. Moonlight shares one lr and one wd across both groups.
+    only. Moonlight shares one lr and one wd across both groups. Lion-Muon
+    follows Muon/Manifold: its AdamW group uses adamw_group_lr/wd, its own
+    (lr, wd) apply to the matrix group; alpha/beta1/beta2/period come from
+    the hashed cfg["lionmuon"] dict (all four REQUIRED — no silent defaults).
     """
     from muonarch.manifold import ManifoldMuon  # local: keeps optim <- msign-free
 
@@ -375,6 +489,15 @@ def build_optimizers(cfg: dict, model) -> tuple:
             MuonFamily(muon_params, lr=cfg["lr"], wd=cfg["wd"],
                        momentum=momentum, rule="keller",
                        ns_steps=ns_steps, ns_dtype=ns_dtype),
+        ]
+    elif name == "lionmuon":
+        lm = cfg["lionmuon"]
+        opts = [
+            LionMuon(muon_params, lr=cfg["lr"], wd=cfg["wd"],
+                     alpha=lm["alpha"], beta1=lm["beta1"], beta2=lm["beta2"],
+                     period=lm["period"],
+                     ns_steps=ns_steps, ns_dtype=ns_dtype),
+            adamw_group(cfg["adamw_group_lr"], cfg["adamw_group_wd"]),
         ]
     else:  # unreachable: split_params validated the name
         raise ValueError(f"Unknown optimizer: {name!r}")

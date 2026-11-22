@@ -22,6 +22,7 @@ from pathlib import Path
 
 __all__ = [
     "HASHED_FIELDS",
+    "OMITTED_WHEN_NULL",
     "canonical",
     "config_hash",
     "result_path",
@@ -32,8 +33,9 @@ __all__ = [
 ]
 
 #: Exactly the starred fields of the §4 run-config schema — the identity of a
-#: run. Dict-valued fields (manifold, branch, schedule, eval, data) are hashed
-#: whole, nested keys included.
+#: run. Dict-valued fields (manifold, branch, schedule, eval, data, lionmuon)
+#: are hashed whole, nested keys included. "lionmuon" is a later addition and
+#: is hashed only when set (see OMITTED_WHEN_NULL / ``canonical``).
 HASHED_FIELDS: frozenset[str] = frozenset({
     "schema_version",
     "study",
@@ -66,7 +68,15 @@ HASHED_FIELDS: frozenset[str] = frozenset({
     "router_aux_loss_coef",
     "eval",
     "data",
+    "lionmuon",
 })
+
+#: Hashed fields added AFTER results existed on disk. ``canonical`` leaves
+#: such a field OUT of the hashed view when it is absent/None, so every run
+#: that predates the field (and every run it does not apply to) keeps its
+#: hash byte for byte. ANY future hashed field must be added here too.
+#:   "lionmuon": {"period", "alpha", "beta1", "beta2"} — Lion-Muon runs only.
+OMITTED_WHEN_NULL: frozenset[str] = frozenset({"lionmuon"})
 
 
 def canonical(cfg: dict) -> dict:
@@ -77,8 +87,20 @@ def canonical(cfg: dict) -> dict:
     must be JSON-serializable: numbers, strings, booleans, null, and
     lists/dicts of those (tuples serialize as lists, so tuple/list spelling
     does not fork identities).
+
+    Exception — OMITTED_WHEN_NULL fields (currently "lionmuon"): these were
+    added to the schema after ~600 results were already keyed by this hash.
+    Emitting ``"lionmuon": null`` for the old runs would change the canonical
+    JSON and therefore EVERY existing hash, orphaning all results on disk. So
+    such a field appears in the hashed view only when it carries a value
+    (non-None); absent/None it is omitted and the canonical JSON of every
+    pre-existing config is byte-identical to before. Absent == null still
+    holds for them. Any hashed field added in the future MUST follow the same
+    rule (add it to OMITTED_WHEN_NULL); tests/test_hash_identity.py checks
+    every tracked result file against its filename.
     """
-    return {k: cfg.get(k) for k in sorted(HASHED_FIELDS)}
+    return {k: cfg.get(k) for k in sorted(HASHED_FIELDS)
+            if not (k in OMITTED_WHEN_NULL and cfg.get(k) is None)}
 
 
 def config_hash(cfg: dict) -> str:
@@ -371,7 +393,9 @@ def estimate_flops(cfg: dict) -> int:
     dual_cap + 1 per matrix per step (at most ``cap`` ascent calls plus the
     retraction, measured on the real ManifoldMuon; early stop gives
     taken + 2 <= cap + 1) — an upper bound, so early stopping only makes
-    real runs cheaper."""
+    real runs cheaper. Lion-Muon is exact, not a per-step average: its Muon
+    steps are the run steps t with t % period == 0
+    (flops.lionmuon_optimizer_flops)."""
     from muonarch import flops as flops_mod
     from muonarch import train
     from muonarch.optim import split_params
@@ -388,6 +412,11 @@ def estimate_flops(cfg: dict) -> int:
             muon_mats, vec_sizes, "manifold",
             msign_steps=m.get("msign_steps", 10),
             msign_calls=m.get("dual_cap", 5) + 1)
+    elif cfg["optimizer"] == "lionmuon":
+        n = _run_steps(cfg)
+        return n * model_fl + flops_mod.lionmuon_optimizer_flops(
+            muon_mats, vec_sizes, n_steps=n,
+            period=cfg["lionmuon"]["period"], ns_steps=cfg["ns_steps"])
     else:
         opt_fl = flops_mod.optimizer_flops_per_step(
             muon_mats, vec_sizes, cfg["optimizer"], ns_steps=cfg["ns_steps"])

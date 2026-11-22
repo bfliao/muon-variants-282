@@ -14,8 +14,8 @@ from muonarch.manifold import ManifoldMuon
 from muonarch.models import build_dense, build_mlp, build_moe
 from muonarch.optim import MuonFamily, ParamGroups, build_optimizers, split_params
 
-OPTIMIZERS = ("adamw", "muon", "moonlight", "manifold", "muonall")
-SPLIT_LIKE_MUON = ("muon", "moonlight", "manifold")
+OPTIMIZERS = ("adamw", "muon", "moonlight", "manifold", "muonall", "lionmuon")
+SPLIT_LIKE_MUON = ("muon", "moonlight", "manifold", "lionmuon")
 
 
 @pytest.fixture(scope="module")
@@ -246,6 +246,9 @@ def base_cfg(optimizer, arch, **over):
         cfg["manifold"] = {
             "dual_cap": 5, "tol": 1e-6, "dual_lr": 0.01, "msign_steps": 10,
         }
+    if optimizer == "lionmuon":
+        cfg["momentum"] = None
+        cfg["lionmuon"] = {"period": 5, "alpha": 30.0, "beta1": 0.9, "beta2": 0.99}
     cfg.update(over)
     return cfg
 

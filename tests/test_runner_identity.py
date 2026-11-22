@@ -59,10 +59,16 @@ def make_cfg(**over) -> dict:
         "router_aux_loss_coef": None,
         "eval": {"every_steps": 176, "val_small_tokens": None, "val_final": "full"},
         "data": {"dataset": "cifar5m", "version": "cifar5m-p0p1-v1"},
+        # added with Lion-Muon; hashed only when set (runner.OMITTED_WHEN_NULL)
+        "lionmuon": None,
     }
     cfg.update(over)
     return cfg
 
+
+#: runner.config_hash(make_cfg()) under the pre-Lion-Muon code (commit
+#: 8b0f14f, 31 hashed fields) — measured there, pinned here.
+GOLDEN_HASH = "8dc71f2a8d44"
 
 #: §4 "logged in the result/log files, NEVER hashed".
 LOGGED_ONLY = {
@@ -143,7 +149,23 @@ def test_logged_only_fields_do_not_change_hash():
 def test_canonical_keeps_only_hashed_fields():
     cfg = dict(make_cfg(), **LOGGED_ONLY)
     canon = runner.canonical(cfg)
+    # the null "lionmuon" of a non-Lion-Muon run is left out of the hashed
+    # view (so the ~600 runs that predate the field keep their hashes) ...
+    assert set(canon) == set(runner.HASHED_FIELDS) - set(runner.OMITTED_WHEN_NULL)
+    # ... and present as soon as it carries a value
+    lm = {"period": 5, "alpha": 30.0, "beta1": 0.9, "beta2": 0.99}
+    canon = runner.canonical(dict(make_cfg(optimizer="lionmuon", lionmuon=lm),
+                                  **LOGGED_ONLY))
     assert set(canon) == set(runner.HASHED_FIELDS)
+
+
+def test_hash_of_a_pre_lionmuon_config_is_frozen():
+    """Golden value: sha256 of the 31-field canonical JSON, computed with the
+    pre-Lion-Muon code (commit 8b0f14f). Absent and null "lionmuon" both
+    hash to it."""
+    cfg = make_cfg()
+    bare = {k: v for k, v in cfg.items() if k != "lionmuon"}
+    assert runner.config_hash(cfg) == runner.config_hash(bare) == GOLDEN_HASH
 
 
 # ---------------------------------------------------------------- sensitivity

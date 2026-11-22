@@ -27,6 +27,7 @@ import torch.nn as nn
 from muonarch.flops import (
     attn_flops,
     break_even_ratio,
+    lionmuon_optimizer_flops,
     lm_flops_per_step,
     mlp_flops_per_step,
     ns_matrix_flops,
@@ -111,6 +112,50 @@ def test_manifold_requires_and_uses_msign_calls():
     # fractional means (logged msign_calls_mean) are accepted
     f_half = optimizer_flops_per_step(shapes, [], "manifold", msign_calls=7.5)
     assert f7 < f_half < f8
+
+
+def test_lionmuon_step_types():
+    """A Muon step costs what Moonlight's step costs; a sign step only the
+    ~10 FLOPs/param overhead; the step type is REQUIRED (never averaged)."""
+    shapes = MLP_MUON_SHAPES[128]
+    vecs = MLP_VEC_SIZES(128)
+    with pytest.raises(ValueError):
+        optimizer_flops_per_step(shapes, vecs, "lionmuon", ns_steps=5)
+    moonlight = optimizer_flops_per_step(shapes, vecs, "moonlight", ns_steps=5)
+    adamw = optimizer_flops_per_step(shapes, vecs, "adamw")
+    assert optimizer_flops_per_step(
+        shapes, vecs, "lionmuon", ns_steps=5, muon_step=True) == moonlight
+    assert optimizer_flops_per_step(
+        shapes, vecs, "lionmuon", ns_steps=5, muon_step=False) == adamw
+    assert adamw == 10 * (sum(m * n for m, n in shapes) + sum(vecs))
+
+
+@pytest.mark.parametrize("n_steps", [1, 4, 5, 6, 16, 2441, 3520])
+def test_lionmuon_run_total_counts_the_muon_steps_taken(n_steps):
+    """N steps from step 0 at period 5: Muon steps at t = 0, 5, 10, ... —
+    ceil(N / 5) of them — plus the overhead on every step. Exact integer
+    arithmetic, not N x an averaged per-step cost."""
+    shapes = MLP_MUON_SHAPES[128]
+    vecs = MLP_VEC_SIZES(128)
+    ns_sum = sum(ns_matrix_flops(s, 5) for s in shapes)
+    overhead = 10 * (sum(m * n for m, n in shapes) + sum(vecs))
+    n_muon = len([t for t in range(n_steps) if t % 5 == 0])
+    assert n_muon == -(-n_steps // 5)
+    got = lionmuon_optimizer_flops(shapes, vecs, n_steps=n_steps, period=5)
+    assert got == n_muon * ns_sum + n_steps * overhead
+    # period 1 is Moonlight on every step
+    assert lionmuon_optimizer_flops(shapes, vecs, n_steps=n_steps, period=1) == (
+        n_steps * optimizer_flops_per_step(shapes, vecs, "moonlight", ns_steps=5))
+
+
+def test_existing_optimizer_flops_ignore_the_new_argument():
+    shapes = MLP_MUON_SHAPES[128]
+    vecs = MLP_VEC_SIZES(128)
+    for name in ("adamw", "muon", "moonlight", "muonall"):
+        base = optimizer_flops_per_step(shapes, vecs, name, ns_steps=5)
+        for flag in (True, False):
+            assert optimizer_flops_per_step(
+                shapes, vecs, name, ns_steps=5, muon_step=flag) == base
 
 
 def test_unknown_optimizer_rejected():
