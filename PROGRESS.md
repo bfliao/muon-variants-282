@@ -88,3 +88,12 @@ _FINAL_SEED_COUNT = 5 (DAG-only; seeds 1-3 hashes unchanged). New jobs: 10 fresh
 - Reviewer notes left open (not wrong on current data): no warning if fresh seeds disagree on a non-LR hyper or if the fallback context is used; F2 legend wording for the partly-extrapolated mlp128 Muon; hollow markers slightly larger than filled.
 - Results and per-run logs are now tracked in git (6ffe0c1). FineWeb tokens published: https://huggingface.co/datasets/Paulopasso/fineweb-edu-bpe4096-45m (verified byte-identical on anonymous download). README added (ab3a12f).
 - Still open for Paul: dense AdamW baseline check (lr 0.002/0.004, seeds 1-3); MoE compute plan.
+
+## 2026-11-21 — Lion-Muon added as a sixth optimizer (DEVIATIONS #15)
+- Reference: brain-lab-research/lion-muon e9077a8, vendored in third_party/lion_muon (test oracle only). P = 5 and beta1 = 0.9 fixed; lr, wd, alpha, beta2, clip tuned by the same coordinate descent.
+- Implementation reviewed independently: APPROVE. All existing run hashes unchanged (asserted against every file in results/). Full suite: 572 passed.
+- 151 runs: mlp128 21, mlp256 48, mlp512 48, dense 34. Final val loss (3 seeds): mlp128 0.8590, mlp256 0.7317, mlp512 0.6835, dense 3.9412.
+- Tuned configs: mlp128 lr 0.002 wd 0.1 alpha 30 beta2 0.99; mlp256 lr 0.004 wd 0.3 alpha 300 beta2 0.95; mlp512 lr 0.002 wd 0.3 alpha 300 beta2 0.95; dense lr 0.016 wd 0.1 alpha 30 beta2 0.95.
+- Caveats for the report: alpha = 300 is the grid edge at mlp256/mlp512 (no edge extension for alpha); Lion-Muon gets one more sweep than Muon; P = 5 only; at mlp256/mlp512 beta2 changed in pass 2, so no lr/wd/alpha sweep exists at the accepted config (figures draw the last sweep dashed; LR basin printed as "—"); one diverged tuning run (mlp512, alpha 3).
+- Figures and tables include Lion-Muon; hypotheses.csv byte-identical (H1-H7 restricted to the pre-registered five). Figure review: all values verified against raw results; its requested wording/honesty fixes applied (the follow-up fixes themselves were checked by the lead, not re-reviewed).
+- tables/main.md now uses display labels and the figures' optimizer order.
