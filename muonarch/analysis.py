@@ -52,7 +52,17 @@ import pandas as pd
 STUDIES: tuple[str, ...] = ("mlp128", "mlp256", "mlp512", "dense", "moe")
 STUDY_A: tuple[str, ...] = ("mlp128", "mlp256", "mlp512")
 STUDY_B: tuple[str, ...] = ("dense", "moe")
-OPTIMIZERS: tuple[str, ...] = ("adamw", "muon", "moonlight", "manifold", "muonall")
+#: Every optimizer of the comparison.  Lion-Muon ("lionmuon") joined after the
+#: protocol freeze (DEVIATIONS.md #15) and is appended LAST, so the order of
+#: the five original optimizers — and every table row built from it — is
+#: unchanged.  Generic per-optimizer computations iterate over this tuple.
+OPTIMIZERS: tuple[str, ...] = ("adamw", "muon", "moonlight", "manifold", "muonall",
+                               "lionmuon")
+#: The five optimizers of the pre-registered protocol.  The hypotheses H1-H7
+#: were written about these and ONLY these: ``hypothesis_verdicts`` never lets
+#: a later addition (Lion-Muon) enter a verdict or its text.
+PREREGISTERED_OPTIMIZERS: tuple[str, ...] = ("adamw", "muon", "moonlight",
+                                             "manifold", "muonall")
 
 #: One fixed colour per optimizer, used by every figure.
 OPTIMIZER_COLORS: dict[str, str] = {
@@ -61,6 +71,7 @@ OPTIMIZER_COLORS: dict[str, str] = {
     "moonlight": "#2ca02c",
     "manifold": "#d62728",
     "muonall": "#9467bd",
+    "lionmuon": "#8c564b",
 }
 
 #: One fixed marker per optimizer, so coinciding series stay distinguishable.
@@ -70,6 +81,7 @@ OPTIMIZER_MARKERS: dict[str, str] = {
     "moonlight": "^",
     "manifold": "D",
     "muonall": "v",
+    "lionmuon": "P",
 }
 
 #: figure_5 horizontal dodge between adjacent optimizers, in log2-width units.
@@ -112,7 +124,21 @@ _RESULT_TOP_FIELDS = (
     "msign_calls_mean", "edge_rule_fired", "device", "precision",
     "wall_clock_s",
 )
+#: Lion-Muon's two tuned extra hyperparameters, flattened out of the run
+#: config's ``lionmuon`` dict ({"period", "alpha", "beta1", "beta2"}; only
+#: lionmuon configs carry it) into scalar columns.  NaN for every other
+#: optimizer.  alpha = Muon-step lr / sign-step lr; beta2 = the EMA decay.
+LIONMUON_COLS: tuple[str, ...] = ("lionmuon_alpha", "lionmuon_beta2")
+
+
+def _lionmuon_fields(cfg: dict) -> dict:
+    lm = cfg.get("lionmuon")
+    lm = lm if isinstance(lm, dict) else {}
+    return {"lionmuon_alpha": lm.get("alpha"), "lionmuon_beta2": lm.get("beta2")}
+
+
 _NUMERIC_COLS = (
+    "lionmuon_alpha", "lionmuon_beta2",
     "seed", "lr", "wd", "momentum", "budget_multiplier", "width", "batch",
     "seq_len", "budget_base_steps", "final_val_loss", "final_val_acc",
     "final_test_loss", "final_test_acc", "train_val_gap", "dual_steps_mean",
@@ -128,7 +154,9 @@ def load_results(root: Path | str) -> pd.DataFrame:
     """One row per ``results/<study>/<hash>.json``, config fields flattened.
 
     Flattened columns: the config fields listed in ``_RESULT_CONFIG_FIELDS``,
-    the top-level result fields, and ``flops_model/optimizer/total``.
+    Lion-Muon's ``lionmuon_alpha`` / ``lionmuon_beta2`` (``LIONMUON_COLS``;
+    NaN for the other optimizers), the top-level result fields, and
+    ``flops_model/optimizer/total``.
     Missing values become NaN/None.  ``df.attrs["root"]`` records the root.
     """
     root = Path(root)
@@ -137,6 +165,7 @@ def load_results(root: Path | str) -> pd.DataFrame:
         res = json.loads(p.read_text())
         cfg = res.get("config", {})
         row = {k: cfg.get(k) for k in _RESULT_CONFIG_FIELDS}
+        row.update(_lionmuon_fields(cfg))
         row.update({k: res.get(k) for k in _RESULT_TOP_FIELDS})
         flops = res.get("flops") or {}
         row["flops_model"] = flops.get("model")
@@ -183,6 +212,7 @@ def load_logs(root: Path | str) -> pd.DataFrame:
             if t == "start":
                 cfg = rec.get("config", {})
                 base = {k: cfg.get(k) for k in _RESULT_CONFIG_FIELDS}
+                base.update(_lionmuon_fields(cfg))
                 base["hash"] = rec.get("hash")
                 continue
             if t not in ("eval", "final"):
@@ -197,7 +227,8 @@ def load_logs(root: Path | str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     for c in ("seed", "step", "images_or_tokens", "val_loss", "train_loss",
               "max_attn_logit", "expert_entropy", "budget_multiplier",
-              "budget_base_steps", "batch", "seq_len", "width"):
+              "budget_base_steps", "batch", "seq_len", "width",
+              *LIONMUON_COLS):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df.attrs["root"] = str(root)
@@ -471,7 +502,10 @@ def speedup_extrapolation(study: str, df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Scalar metrics
 
-_CD_OTHER_HYPERS = ("wd", "momentum", "grad_clip", "adamw_betas")
+#: The non-lr tuned hypers that define a coordinate-descent context.  The two
+#: Lion-Muon columns are NaN (-> None) on every other optimizer's rows, so
+#: they never change those optimizers' contexts.
+_CD_OTHER_HYPERS = ("wd", "momentum", "grad_clip", "adamw_betas") + LIONMUON_COLS
 
 
 def _hyper_norm(v):
@@ -516,7 +550,8 @@ def _lr_sweep_rows(df: pd.DataFrame, study: str, opt: str,
     Selection of the cd lr-sweep cells:
 
     1. Context = the ACCEPTED values of the non-lr tuned hypers (wd,
-       momentum, grad_clip, adamw_betas, where present).  These are read off
+       momentum, grad_clip, adamw_betas — and Lion-Muon's alpha and beta2 —
+       where present).  These are read off
        the optimizer's completed fresh-seed runs, which are run at exactly
        the accepted config — so the context is the accepted one whatever
        ``cd_sweep`` labels the rows carry.  (Config dedup gives a re-run cell
@@ -932,9 +967,12 @@ def spectral_norm_means(logs: pd.DataFrame | None,
 # ---------------------------------------------------------------------------
 # Hypothesis verdicts
 
-def _best_variant(df: pd.DataFrame, study: str) -> str | None:
+def _best_variant(df: pd.DataFrame, study: str,
+                  optimizers: tuple[str, ...] = OPTIMIZERS) -> str | None:
+    """Non-AdamW optimizer with the lowest mean fresh-seed loss, among
+    ``optimizers`` (H1 passes the pre-registered five)."""
     means = {o: _fresh(df, study, o)["final_val_loss"].mean()
-             for o in OPTIMIZERS if o != "adamw" and not _fresh(df, study, o).empty}
+             for o in optimizers if o != "adamw" and not _fresh(df, study, o).empty}
     return min(means, key=means.get) if means else None
 
 
@@ -952,7 +990,19 @@ def hypothesis_verdicts(df: pd.DataFrame, logs: pd.DataFrame | None = None) -> p
     (as text, with numbers), a verdict in {supported, falsified,
     indistinguishable}, and the seed-rule caveat.  Missing data never raises:
     the verdict degrades to "indistinguishable" with a note.
+
+    The hypotheses were pre-registered about five optimizers
+    (``PREREGISTERED_OPTIMIZERS``).  Rows of any optimizer added later
+    (Lion-Muon, DEVIATIONS.md #15) are dropped on entry, so no verdict, test
+    quantity or text can change when its results appear: "best variant" (H1),
+    "every variant" (H2a), "at least one variant" (H3) and "the curves
+    separate" (H7) all keep meaning the variants the hypothesis named.
     """
+    if "optimizer" in df.columns:
+        df = df[df["optimizer"].isin(PREREGISTERED_OPTIMIZERS)]
+    if logs is not None and "optimizer" in logs.columns:
+        # defence in depth: H7 also hash-matches its logs against ``df``
+        logs = logs[logs["optimizer"].isin(PREREGISTERED_OPTIMIZERS)]
     rows = []
 
     def add(h, study, quantity, verdict):
@@ -962,7 +1012,7 @@ def hypothesis_verdicts(df: pd.DataFrame, logs: pd.DataFrame | None = None) -> p
     # H1: best dense variant's token speedup range in [1.0, 1.4]
     try:
         tok = token_speedup_range("dense", df)
-        best = _best_variant(df, "dense")
+        best = _best_variant(df, "dense", PREREGISTERED_OPTIMIZERS)
         lo, hi = float(tok.loc[best, "speedup_min"]), float(tok.loc[best, "speedup_max"])
         if hi < 1.0 or lo > 1.4:
             v = "falsified"
@@ -1132,6 +1182,13 @@ def hypothesis_verdicts(df: pd.DataFrame, logs: pd.DataFrame | None = None) -> p
 
 # ---------------------------------------------------------------------------
 # Figures
+
+def _optimizers_present(df: pd.DataFrame) -> tuple[str, ...]:
+    """OPTIMIZERS that have any row in ``df`` (legacy figures 5-7 lay out one
+    slot per optimizer; an optimizer without data gets no slot)."""
+    present = set(df["optimizer"].dropna())
+    return tuple(o for o in OPTIMIZERS if o in present)
+
 
 def _studies_present(df: pd.DataFrame) -> list[str]:
     present = set(df["study"].dropna())
@@ -1339,8 +1396,9 @@ def figure_5(df: pd.DataFrame, outdir: Path | str) -> Path:
     # identical optima (e.g. muon == muonall at every width) would hide lines
     # under each other: each optimizer gets its own marker and a small
     # horizontal dodge in log2-width space (plotted values are unchanged)
-    n_opt = len(OPTIMIZERS)
-    for k, opt in enumerate(OPTIMIZERS):
+    optimizers = _optimizers_present(df)
+    n_opt = len(optimizers)
+    for k, opt in enumerate(optimizers):
         w, lr, loss = [], [], []
         for s in studies:
             fr = _fresh(df, s, opt)
@@ -1378,14 +1436,15 @@ def figure_6(df: pd.DataFrame, outdir: Path | str) -> Path:
     if not studies:
         _no_data(ax, "no fresh-seed runs")
         return _save(fig, outdir, "fig6_optimizer_cost.png")
-    width = 0.8 / len(OPTIMIZERS)
-    for k, opt in enumerate(OPTIMIZERS):
+    optimizers = _optimizers_present(df)
+    width = 0.8 / len(optimizers)
+    for k, opt in enumerate(optimizers):
         xs, ys = [], []
         for i, s in enumerate(studies):
             fr = _fresh(df, s, opt)
             if fr.empty:
                 continue
-            xs.append(i + (k - 2) * width)
+            xs.append(i + (k - (len(optimizers) - 1) / 2) * width)
             ys.append(float((fr["flops_optimizer"] / fr["flops_model"]).mean()))
         if xs:
             ax.bar(xs, ys, width=width * 0.9, color=OPTIMIZER_COLORS[opt], label=opt)
@@ -1420,11 +1479,12 @@ def figure_7(df: pd.DataFrame, outdir: Path | str) -> Path:
         fig, ax = plt.subplots(figsize=(4, 3))
         _no_data(ax, "no Stage-B or coordinate-descent trials")
         return _save(fig, outdir, "fig7_lr_wd.png")
-    fig, axes = plt.subplots(len(OPTIMIZERS), len(studies),
-                             figsize=(3.4 * len(studies), 2.4 * len(OPTIMIZERS)),
+    optimizers = _optimizers_present(df)
+    fig, axes = plt.subplots(len(optimizers), len(studies),
+                             figsize=(3.4 * len(studies), 2.4 * len(optimizers)),
                              squeeze=False)
     for col, study in enumerate(studies):
-        for row, opt in enumerate(OPTIMIZERS):
+        for row, opt in enumerate(optimizers):
             ax = axes[row][col]
             g = per_study[study]
             g = g[g["optimizer"] == opt].dropna(subset=["final_val_loss", "lr"])

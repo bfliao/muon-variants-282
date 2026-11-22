@@ -52,13 +52,15 @@ from muonarch import analysis as an
 # Style
 
 #: Fixed optimizer order of every figure.
-OPT_ORDER: tuple[str, ...] = ("adamw", "muon", "moonlight", "muonall", "manifold")
+OPT_ORDER: tuple[str, ...] = ("adamw", "muon", "moonlight", "muonall", "lionmuon",
+                              "manifold")
 
 OPT_LABEL: dict[str, str] = {
     "adamw": "AdamW",
     "muon": "Muon",
     "moonlight": "Moonlight",
     "muonall": "MuonAll",
+    "lionmuon": "Lion-Muon",
     "manifold": "Manifold Muon",
 }
 OPT_COLOR: dict[str, str] = {
@@ -67,6 +69,7 @@ OPT_COLOR: dict[str, str] = {
     "moonlight": "#eda100",
     "manifold": "#008300",
     "muonall": "#e87ba4",
+    "lionmuon": "#6b3fa0",
 }
 OPT_MARKER: dict[str, str] = {
     "adamw": "o",
@@ -74,6 +77,7 @@ OPT_MARKER: dict[str, str] = {
     "moonlight": "D",
     "manifold": "^",
     "muonall": "v",
+    "lionmuon": "P",
 }
 STUDY_LABEL: dict[str, str] = {
     "mlp128": "MLP-128",
@@ -99,15 +103,30 @@ FULL_W = 7.2
 COL_W = 3.5
 DPI = 200
 
-#: CD hyperparameter columns of F6, in order.  "momentum" is beta1 for AdamW
-#: (as in studies.cd_hypers).
-CD_HYPERS: tuple[str, ...] = ("lr", "wd", "momentum", "beta2", "clip")
+#: CD hyperparameter columns of F6, in the sweep order of studies.CD_ORDER.
+#: "momentum" is beta1 for AdamW (as in studies.cd_hypers); "beta2" is AdamW's
+#: second-moment decay and Lion-Muon's EMA decay; "alpha" (Muon-step lr ÷
+#: sign-step lr) exists for Lion-Muon only.
+CD_HYPERS: tuple[str, ...] = ("lr", "wd", "alpha", "momentum", "beta2", "clip")
 CD_HYPER_LABEL: dict[str, str] = {
     "lr": "Learning rate",
     "wd": "Weight decay",
+    "alpha": "α (Muon LR ÷ sign LR)",
     "momentum": "Momentum / β₁",
     "beta2": "β₂",
     "clip": "Gradient clip",
+}
+#: Columns F6 draws only when the optimizer that owns them is in the figure.
+CD_HYPER_OWNER: dict[str, str] = {"alpha": "lionmuon"}
+#: Two-line column titles for the six-column F6 grid (a column is then about
+#: 1 in wide, too narrow for the one-line titles).
+CD_HYPER_LABEL_NARROW: dict[str, str] = {
+    "lr": "Learning\nrate",
+    "wd": "Weight\ndecay",
+    "alpha": "α = Muon LR\n÷ sign LR",
+    "momentum": "Momentum\n/ β₁",
+    "beta2": "β₂",
+    "clip": "Gradient\nclip",
 }
 #: CIFAR test-split size (a protocol constant, muonarch/data.py CIFAR_N_TEST),
 #: used only for the binomial standard error bar of A4.
@@ -316,20 +335,38 @@ def _num(v) -> float | None:
 
 def _hypers(row: dict, opt: str) -> dict:
     """The CD hyperparameters of a run, normalised and hashable.  ``momentum``
-    is beta1 for AdamW; ``beta2`` exists only for AdamW; ``clip`` is +inf for
-    'no clipping'."""
+    is beta1 for AdamW and does not exist for Lion-Muon; ``beta2`` exists for
+    AdamW (``adamw_betas[1]``) and for Lion-Muon (its EMA decay, the
+    ``lionmuon_beta2`` column of ``analysis.load_results``); ``alpha`` exists
+    for Lion-Muon only (``lionmuon_alpha``); ``clip`` is +inf for 'no
+    clipping'."""
     betas = row.get("adamw_betas")
     b1 = b2 = None
     if isinstance(betas, (list, tuple)) and len(betas) == 2:
         b1, b2 = _num(betas[0]), _num(betas[1])
     clip = _num(row.get("grad_clip"))
+    if opt == "lionmuon":
+        momentum, alpha = None, _num(row.get("lionmuon_alpha"))
+        beta2 = _num(row.get("lionmuon_beta2"))
+    else:
+        momentum = b1 if opt == "adamw" else _num(row.get("momentum"))
+        alpha, beta2 = None, (b2 if opt == "adamw" else None)
     return {
         "lr": _num(row.get("lr")),
         "wd": _num(row.get("wd")),
-        "momentum": b1 if opt == "adamw" else _num(row.get("momentum")),
-        "beta2": b2 if opt == "adamw" else None,
+        "alpha": alpha,
+        "momentum": momentum,
+        "beta2": beta2,
         "clip": math.inf if clip is None else clip,
     }
+
+
+def f6_columns(opts) -> list[str]:
+    """The hyperparameter columns of an F6 grid over ``opts``, in CD_HYPERS
+    order: a column owned by one optimizer (alpha: Lion-Muon) is drawn only
+    when that optimizer is in the grid."""
+    return [h for h in CD_HYPERS
+            if CD_HYPER_OWNER.get(h) is None or CD_HYPER_OWNER[h] in opts]
 
 
 def accepted_config(df: pd.DataFrame, study: str, opt: str) -> dict | None:
@@ -1299,7 +1336,8 @@ def _curve_figure(df, logs, outdir, stem: str, xkind: str) -> list[Path]:
         handles.append(Patch(facecolor=PALE, alpha=0.35, lw=0,
                              label=f"min–max over {seeds_text(stem, n_by)} seeds "
                                    f"(line: mean)"))
-        _legend(fig, handles, ncol=len(handles))
+        _legend(fig, handles, ncol=len(handles) if len(handles) <= 6
+                else math.ceil(len(handles) / 2))
         return _save(fig, outdir, stem)
 
 
@@ -1329,11 +1367,27 @@ def fig_f5(df, logs, outdir) -> list[Path]:
         return _skip("f5_width_transfer", "no MLP learning-rate sweeps")
     opts = [o for o in OPT_ORDER if any(not lr_sweep(df, s, o).empty for s, _ in widths)]
     clip = 0.15
+    # up to five optimizers: one block (a row of loss panels over a row of
+    # basin panels); more: two blocks, so a panel stays wide enough to read
+    per_row = len(opts) if len(opts) <= 5 else math.ceil(len(opts) / 2)
+    blocks = math.ceil(len(opts) / per_row)
     with style():
-        fig, axes = _subplots(2, len(opts), (FULL_W, 4.0), sharex="col")
+        if blocks == 1:
+            fig, axes = _subplots(2, per_row, (FULL_W, 4.0), sharex="col")
+        else:
+            fig, axes = _subplots(2 * blocks, per_row, (FULL_W, 3.6 * blocks + 0.5))
+        pairs = [(axes[2 * (j // per_row)][j % per_row],
+                  axes[2 * (j // per_row) + 1][j % per_row]) for j in range(len(opts))]
+        if blocks > 1:
+            for a0, a1 in pairs:
+                a0.sharex(a1)
+                a0.tick_params(labelbottom=False)
+            for ax in axes.ravel():     # an odd count leaves one pair empty
+                if not any(ax is a for pr in pairs for a in pr):
+                    ax.set_visible(False)
         any_div = any_raw = any_early = False
         for j, opt in enumerate(opts):
-            a0, a1 = axes[0][j], axes[1][j]
+            a0, a1 = pairs[j]
             all_lrs, sel, tops = [], {}, []
             early: set[float] = set()
             for study, w in widths:
@@ -1394,13 +1448,14 @@ def fig_f5(df, logs, outdir) -> list[Path]:
                                                 shrinkA=0, shrinkB=0,
                                                 mutation_scale=7))
                 a1.set_title(f"{lo_w}→{hi_w}: {txt}", fontsize=8, pad=3)
-            if j > 0:
+            if j % per_row > 0:
                 a1.tick_params(labelleft=False)
-        for ax in axes[1][1:]:
-            ax.sharey(axes[1][0])
-        axes[1][0].set_ylim(-0.03, clip)
-        axes[0][0].set_ylabel("Final validation loss\n(lower is better)")
-        axes[1][0].set_ylabel("Loss − curve minimum")
+        for _, a1 in pairs[1:]:
+            a1.sharey(pairs[0][1])
+        pairs[0][1].set_ylim(-0.03, clip)
+        for a0, a1 in pairs[::per_row]:
+            a0.set_ylabel("Final validation loss\n(lower is better)")
+            a1.set_ylabel("Loss − curve minimum")
         fig.supxlabel("Learning rate (log scale; ticks mark the tested values, "
                       "a factor 2 apart)", fontsize=9)
         handles = [Line2D([], [], color=WIDTH_COLOR.get(w, INK2), marker="o", ms=4.2,
@@ -1486,8 +1541,11 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
     if not opts:
         return _skip(stem, "no coordinate-descent runs")
     thr = noise_threshold(df, study)
+    hypers = f6_columns(opts)
+    narrow = len(hypers) > 5        # the extra alpha column: tighter text
+    titles = CD_HYPER_LABEL_NARROW if narrow else CD_HYPER_LABEL
     with style():
-        fig, axes = _subplots(len(opts), len(CD_HYPERS),
+        fig, axes = _subplots(len(opts), len(hypers),
                               (FULL_W, 1.22 * len(opts) + 1.15))
         flags = dict(earlier=False, over=False, div=False, star=False)
         for i, opt in enumerate(opts):
@@ -1500,11 +1558,13 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
             if not near.empty:
                 cands.append(float(near.max()))
             ytop = max(cands + ([2.6 * thr] if np.isfinite(thr) else []) + [1e-6]) * 1.22
-            for j, hyper in enumerate(CD_HYPERS):
+            for j, hyper in enumerate(hypers):
                 ax = axes[i][j]
                 h = sl[sl["hyper"] == hyper]
                 if i == 0:
-                    ax.set_title(CD_HYPER_LABEL[hyper])
+                    ax.set_title(titles[hyper])
+                if narrow:
+                    ax.tick_params(axis="x", labelsize=7)
                 if j == 0:
                     ax.set_ylabel(OPT_LABEL[opt], fontsize=9, fontweight="bold")
                 ax.set_ylim(-0.07 * ytop, ytop)
@@ -1527,6 +1587,20 @@ def fig_f6(df, logs, outdir, study: str) -> list[Path]:
                 if hyper == "lr":
                     xmap = {v: v for v in values}
                     _log_lr_axis(ax, values)
+                elif hyper == "alpha":
+                    # a ratio on a ×~3 grid: log x, every tested value ticked,
+                    # every other one labelled when all would collide
+                    xmap = {v: v for v in values}
+                    ax.set_xscale("log")
+                    ax.set_xlim(min(values) / 1.7, max(values) * 1.7)
+                    major = values[::2] if len(values) > 4 else values
+                    ax.xaxis.set_major_locator(FixedLocator(major))
+                    ax.xaxis.set_major_formatter(FuncFormatter(
+                        lambda v, _: fmt_cat(v)))
+                    ax.xaxis.set_minor_locator(FixedLocator(
+                        [v for v in values if v not in major]))
+                    ax.xaxis.set_minor_formatter(NullFormatter())
+                    ax.grid(axis="x", visible=False)
                 else:
                     xmap = {v: k for k, v in enumerate(values)}
                     ax.set_xlim(-0.5, len(values) - 0.5)
@@ -2043,7 +2117,7 @@ def fig_a4(df, logs, outdir) -> list[Path]:
                    label=f"±1 SE of accuracy ({se:.2f} pt, {N_TEST_IMAGES:,} test "
                          f"images)"),
         ]
-        _legend(fig, handles, ncol=4)
+        _legend(fig, handles, ncol=4 if len(handles) <= 8 else 3)
         return _save(fig, outdir, "a4_loss_vs_accuracy")
 
 
@@ -2250,13 +2324,20 @@ def fig_a8(df, logs, outdir) -> list[Path]:
             if any(not lr_stability(df, s, o).empty for s in studies)]
     ncols = 2 if len(studies) > 1 else 1
     nrows = math.ceil(len(studies) / ncols)
+    # every panel prints its own row labels, so a study without runs of an
+    # optimizer simply has no row for it (rows are shared only while every
+    # study has the same optimizers)
+    all_opts = opts
+    panel_opts = [[o for o in all_opts if not lr_stability(df, s, o).empty]
+                  for s in studies]
     with style():
         fig, axes = _subplots(nrows, ncols, (FULL_W, 1.85 * nrows + 0.75), sharex=True,
-                              sharey=True)
+                              sharey=all(o == panel_opts[0] for o in panel_opts))
         flat = list(axes.ravel())
         all_lrs = []
         flags = dict(high=False, div=False)
         for k, (ax, study) in enumerate(zip(flat, studies)):
+            opts = panel_opts[k]
             pos = _opt_rows(ax, opts, labels=True)
             for opt in opts:
                 t = lr_stability(df, study, opt)

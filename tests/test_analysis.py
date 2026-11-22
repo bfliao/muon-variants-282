@@ -20,6 +20,14 @@ Synthetic world contents (see make_world):
   - AdamW losses lie exactly on a known curve L(D) = a*D^-b + g per study,
     and every other optimizer's final loss is planted at curve(s * D_1x),
     so the fitted/inverted token speedup must recover the planted s.
+
+The base world holds the five pre-registered optimizers (WORLD_OPTS).
+``make_world(root, lionmuon=True)`` adds the sixth, Lion-Muon (DEVIATIONS.md
+#15), to dense and mlp128 (never moe): fresh seeds 1-3 with logs, the same
+Stage A/B trials as the others on dense, and on mlp128 a coordinate descent
+with its two extra hyperparameters — an alpha sweep and a beta2 sweep around
+two lr-sweep passes (see _lionmuon_cd).  It is planted as the BEST optimizer
+of both studies, so any "best optimizer" logic that let it in would show.
 """
 
 from __future__ import annotations
@@ -68,7 +76,22 @@ OPT_RATE = {
     "manifold": 3.0,
     "muonall": 0.35,
 }
-BEST_LR = {"adamw": 0.1, "muon": 0.02, "moonlight": 0.1, "manifold": 0.1, "muonall": 0.02}
+BEST_LR = {"adamw": 0.1, "muon": 0.02, "moonlight": 0.1, "manifold": 0.1, "muonall": 0.02,
+           "lionmuon": 0.05}
+# the five pre-registered optimizers: the whole base world
+WORLD_OPTS = ("adamw", "muon", "moonlight", "manifold", "muonall")
+# Lion-Muon (only in make_world(root, lionmuon=True)): planted as the best
+# optimizer of both studies; cheap optimizer FLOPs; accepted alpha / beta2
+# differ from the coordinate-descent defaults
+LION_PLANTED = {"dense": 1.5, "mlp128": 1.2}
+LION_OPT_RATE = 0.06
+LION_DEFAULT = {"alpha": 30.0, "beta2": 0.99}
+LION_ACCEPTED = {"alpha": 100.0, "beta2": 0.95}
+# mlp128 cd loss offsets above Lion-Muon's best (see _lionmuon_cd)
+LION_PASS1_HANDICAP = 0.05
+LION_WD_OFF = {0.0: 0.045, 0.003: 0.042, 0.03: 0.030}
+LION_ALPHA_OFF = {3.0: 0.060, 10.0: 0.035, 100.0: 0.015, 300.0: 0.025}
+LION_BETA2_OFF = {0.9: 0.012, 0.95: 0.0}
 # stage-A loss offsets above the optimizer's best, index 2 is the grid winner
 STAGE_A_OFF = {
     "dense": [0.09, 0.015, 0.0, 0.012, 0.035, 0.30],
@@ -85,9 +108,30 @@ def curve(study: str, D: float) -> float:
     return a * D ** -b + g
 
 
+def opt_rate(opt: str) -> float:
+    return LION_OPT_RATE if opt == "lionmuon" else OPT_RATE[opt]
+
+
+def planted(study: str, opt: str) -> float:
+    """Planted token speedup of an optimizer (1.0 where none is planted)."""
+    if opt == "lionmuon":
+        return LION_PLANTED[study]
+    return PLANTED[study].get(opt, 1.0)
+
+
 def total_rate(study: str, opt: str) -> float:
     """Total training FLOPs per data unit (model + optimizer) for a run."""
-    return MODEL_RATE[study] * (1.0 + OPT_RATE[opt])
+    return MODEL_RATE[study] * (1.0 + opt_rate(opt))
+
+
+def _lion(alpha=LION_ACCEPTED["alpha"], beta2=LION_ACCEPTED["beta2"]) -> dict:
+    """The config fields only a lionmuon run carries (studies.run_config)."""
+    return {"momentum": None,
+            "lionmuon": {"period": 5, "alpha": alpha, "beta1": 0.9, "beta2": beta2}}
+
+
+def _extra(opt: str) -> dict:
+    return _lion() if opt == "lionmuon" else {}
 
 
 def _cfg(study, opt, phase, seed, lr, wd, mult, **extra):
@@ -119,7 +163,7 @@ def _write_result(root: Path, cfg: dict, loss, status="completed",
     h = hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:12]
     d_run = cfg["budget_multiplier"] * D1[study]
     fm = MODEL_RATE[study] * d_run
-    fo = MODEL_RATE[study] * OPT_RATE[opt] * d_run
+    fo = MODEL_RATE[study] * opt_rate(opt) * d_run
     res = {
         "hash": h,
         "schema_version": 1,
@@ -181,7 +225,43 @@ def _write_log(root: Path, cfg: dict, h: str, final_loss: float):
     out.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
 
 
-def make_world(root: Path) -> None:
+def _lionmuon_cd(root: Path, study: str, best: float, lrs: list[float]) -> None:
+    """Lion-Muon's coordinate descent (seed 0), in studies.cd_hypers order
+    lr, wd, alpha, beta2 — every acceptance moves the centre:
+
+    1. pass-1 lr sweep at the defaults (wd 0.01, alpha 30, beta2 0.99);
+    2. wd sweep at the centre lr: wd 0.03 accepted;
+    3. alpha sweep at wd 0.03: 3 / 10 / 100 / 300 written with the label
+       "alpha" (alpha 30 IS the wd-labelled winner of step 2): 100 accepted;
+    4. beta2 sweep at alpha 100: 0.9 / 0.95 labelled "beta2" (0.99 IS the
+       alpha-labelled winner of step 3): 0.95 accepted;
+    5. pass-2 lr sweep at the accepted (wd 0.03, alpha 100, beta2 0.95): its
+       centre is the beta2-labelled winner of step 4, the other 5 cells are
+       labelled "lr".
+    """
+    d, a = LION_DEFAULT, LION_ACCEPTED
+    centre = lrs[2]
+
+    def w(lr, wd, alpha, beta2, sweep, off):
+        cfg = _cfg(study, "lionmuon", "cd", 0, lr, wd, 1.0, cd_sweep=sweep,
+                   **_lion(alpha, beta2))
+        _write_result(root, cfg, best + off)
+
+    for lr, off in zip(lrs, STAGE_A_OFF[study]):
+        w(lr, 0.01, d["alpha"], d["beta2"], "lr", off + LION_PASS1_HANDICAP)
+    for wd, off in LION_WD_OFF.items():
+        w(centre, wd, d["alpha"], d["beta2"], "wd", off)
+    for alpha, off in LION_ALPHA_OFF.items():
+        w(centre, 0.03, alpha, d["beta2"], "alpha", off)
+    for beta2, off in LION_BETA2_OFF.items():
+        w(centre, 0.03, a["alpha"], beta2, "beta2", off)
+    for i, (lr, off) in enumerate(zip(lrs, STAGE_A_OFF[study])):
+        if i != 2:
+            w(lr, 0.03, a["alpha"], a["beta2"], "lr", off)
+
+
+def make_world(root: Path, lionmuon: bool = False) -> None:
+    opts = WORLD_OPTS + (("lionmuon",) if lionmuon else ())
     for study in ("dense", "mlp128"):
         d1 = D1[study]
         # ---- AdamW budget curve, seeds 1-3 (exactly on the planted curve)
@@ -208,26 +288,28 @@ def make_world(root: Path) -> None:
             _write_result(root, cfg, curve(study, 2 * d1) + 5e-3)
 
         # ---- fresh seeds 1-3 for every optimizer (adamw's double as 1x points)
-        for opt in an.OPTIMIZERS:
+        for opt in opts:
             for seed in (1, 2, 3):
-                s = PLANTED[study].get(opt, 1.0)
+                s = planted(study, opt)
                 loss = curve(study, s * d1) + SEED_EPS[seed]
                 # fresh seeds run at the ACCEPTED config: on mlp128 the
                 # coordinate descent accepted wd=0.03 (see the cd rows below)
                 fresh_wd = 0.03 if study == "mlp128" else 0.01
                 cfg = _cfg(study, opt, "fresh_seed", seed, BEST_LR[opt],
-                           None if opt == "manifold" else fresh_wd, 1.0)
+                           None if opt == "manifold" else fresh_wd, 1.0,
+                           **_extra(opt))
                 h, _ = _write_result(root, cfg, loss)
                 _write_log(root, cfg, h, loss)
 
         # ---- tuning trials, seed 0
-        for opt in an.OPTIMIZERS:
-            best = curve(study, PLANTED[study].get(opt, 1.0) * d1)
+        for opt in opts:
+            best = curve(study, planted(study, opt) * d1)
             lrs = [BEST_LR[opt] * 2 ** (i - 2) for i in range(6)]
             if study == "dense":  # Phase-II style: stage A + stage B
                 for i, (lr, off) in enumerate(zip(lrs, STAGE_A_OFF[study])):
                     cfg = _cfg(study, opt, "stage_a", 0, lr,
-                               None if opt == "manifold" else 0.01, 1.0)
+                               None if opt == "manifold" else 0.01, 1.0,
+                               **_extra(opt))
                     if opt == "muonall" and i == 5:
                         _write_result(root, cfg, None, status="diverged",
                                       diverged_at=500)
@@ -244,10 +326,12 @@ def make_world(root: Path) -> None:
                     off = 0.002 * (j + 1)
                     if opt == "muonall" and j == 5:
                         off = 0.6  # > best + 0.5 nats: diverged at analysis time
-                    cfg = _cfg(study, opt, "stage_b", 0, lr, wd, 1.0)
+                    cfg = _cfg(study, opt, "stage_b", 0, lr, wd, 1.0, **_extra(opt))
                     _write_result(root, cfg, best + off)
             else:  # mlp128, Phase-I style: coordinate descent ("cd") trials
-                if opt == "manifold":  # no wd: a single lr sweep
+                if opt == "lionmuon":
+                    _lionmuon_cd(root, study, best, lrs)
+                elif opt == "manifold":  # no wd: a single lr sweep
                     for lr, off in zip(lrs, STAGE_A_OFF[study]):
                         cfg = _cfg(study, opt, "cd", 0, lr, None, 1.0,
                                    cd_sweep="lr")
@@ -285,8 +369,9 @@ def make_world(root: Path) -> None:
     cfg = _cfg("dense", "muon", "edge", 0, BEST_LR["muon"] * 2 ** 4, 0.01, 1.0)
     _write_result(root, cfg, curve("dense", PLANTED["dense"]["muon"] * D1["dense"]) + 0.4)
 
-    # ---- moe: fresh seeds only (no budget curve, no tuning on disk)
-    for opt in an.OPTIMIZERS:
+    # ---- moe: fresh seeds only (no budget curve, no tuning on disk); the
+    # five pre-registered optimizers only — Lion-Muon is not run on MoE
+    for opt in WORLD_OPTS:
         for seed in (1, 2, 3):
             loss = MOE_FRESH[opt] + SEED_EPS[seed]
             cfg = _cfg("moe", opt, "fresh_seed", seed, BEST_LR[opt],
@@ -312,6 +397,24 @@ def logs(world):
     return an.load_logs(world)
 
 
+@pytest.fixture(scope="module")
+def lion_world(tmp_path_factory):
+    """The base world plus Lion-Muon on dense and mlp128."""
+    root = tmp_path_factory.mktemp("lionworld")
+    make_world(root, lionmuon=True)
+    return root
+
+
+@pytest.fixture(scope="module")
+def lion_df(lion_world):
+    return an.load_results(lion_world)
+
+
+@pytest.fixture(scope="module")
+def lion_logs(lion_world):
+    return an.load_logs(lion_world)
+
+
 # ---------------------------------------------------------------- loading
 
 def test_load_results_flattens(df):
@@ -320,7 +423,7 @@ def test_load_results_flattens(df):
                 "flops_total", "flops_model", "flops_optimizer"):
         assert col in df.columns, col
     assert set(df["study"]) == {"dense", "mlp128", "moe"}
-    assert set(df["optimizer"]) == set(an.OPTIMIZERS)
+    assert set(df["optimizer"]) == set(WORLD_OPTS)
     div = df[df["status"] == "diverged"]
     assert len(div) == 1
     assert div.iloc[0]["optimizer"] == "muonall"
@@ -759,7 +862,7 @@ def test_divergence_rate_uses_headline_track_only():
 def _smoke_moe_logs(root: Path) -> None:
     """MoE smoke runs only (seed 0, one per optimizer): what the real logs
     held before any MoE study ran."""
-    for opt in an.OPTIMIZERS:
+    for opt in WORLD_OPTS:
         cfg = _cfg("moe", opt, "smoke", 0, BEST_LR[opt], 0.01, 1.0)
         h = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12]
         _write_log(root, cfg, h, MOE_FRESH[opt])
@@ -1083,3 +1186,237 @@ def test_load_logs_skips_files_directly_under_diagnostics(tmp_path):
     logs = an.load_logs(tmp_path)
     assert set(logs["hash"]) == {"keep"}
     assert len(logs) == 2
+
+
+# ------------------------------------- Lion-Muon, the sixth optimizer (#15)
+
+def test_lion_world_is_the_base_world_plus_lionmuon_rows(df, lion_df):
+    # fixture guard: every comparison "with vs without Lion-Muon" below is a
+    # comparison of the SAME five-optimizer runs
+    assert set(lion_df["optimizer"]) == set(an.OPTIMIZERS)
+    rest = lion_df[lion_df["optimizer"] != "lionmuon"]
+    assert sorted(rest["hash"]) == sorted(df["hash"])
+    lm = lion_df[lion_df["optimizer"] == "lionmuon"]
+    assert set(lm["study"]) == {"dense", "mlp128"}          # never moe
+    # mlp128 cd: 6 (pass 1) + 3 (wd) + 4 (alpha) + 2 (beta2) + 5 (pass 2)
+    cd = lm[(lm["study"] == "mlp128") & (lm["phase"] == "cd")]
+    assert cd["cd_sweep"].value_counts().to_dict() == {
+        "lr": 11, "wd": 3, "alpha": 4, "beta2": 2}
+    assert an.PREREGISTERED_OPTIMIZERS == WORLD_OPTS
+    assert an.OPTIMIZERS == WORLD_OPTS + ("lionmuon",)      # appended last
+
+
+def test_load_flattens_the_lionmuon_hypers(df, logs, lion_df, lion_logs):
+    cols = list(an.LIONMUON_COLS)
+    assert cols == ["lionmuon_alpha", "lionmuon_beta2"]
+    # no Lion-Muon runs: the columns exist and are empty
+    assert df[cols].isna().all().all() and logs[cols].isna().all().all()
+    lm = lion_df[lion_df["optimizer"] == "lionmuon"]
+    assert lion_df[lion_df["optimizer"] != "lionmuon"][cols].isna().all().all()
+    assert lm[cols].notna().all().all()
+    assert lm["momentum"].isna().all()                      # config["momentum"] None
+    for study in ("dense", "mlp128"):
+        fresh = an._fresh(lion_df, study, "lionmuon")
+        assert len(fresh) == 3
+        assert set(fresh["lionmuon_alpha"]) == {LION_ACCEPTED["alpha"]}
+        assert set(fresh["lionmuon_beta2"]) == {LION_ACCEPTED["beta2"]}
+    cd = lm[(lm["study"] == "mlp128") & (lm["phase"] == "cd")]
+    # the swept value is read from config["lionmuon"], per sweep label
+    a = cd[cd["cd_sweep"] == "alpha"]
+    assert sorted(a["lionmuon_alpha"]) == sorted(LION_ALPHA_OFF)
+    assert set(a["lionmuon_beta2"]) == {LION_DEFAULT["beta2"]}
+    b = cd[cd["cd_sweep"] == "beta2"]
+    assert sorted(b["lionmuon_beta2"]) == sorted(LION_BETA2_OFF)
+    assert set(b["lionmuon_alpha"]) == {LION_ACCEPTED["alpha"]}
+    best = curve("mlp128", LION_PLANTED["mlp128"] * D1["mlp128"])
+    for alpha, off in LION_ALPHA_OFF.items():
+        got = a[a["lionmuon_alpha"] == alpha]["final_val_loss"].iloc[0]
+        assert got == pytest.approx(best + off)
+    # logs carry them too (from the start record's config)
+    ll = lion_logs[lion_logs["optimizer"] == "lionmuon"]
+    assert set(ll["lionmuon_alpha"]) == {LION_ACCEPTED["alpha"]}
+    assert set(ll["lionmuon_beta2"]) == {LION_ACCEPTED["beta2"]}
+    assert lion_logs[lion_logs["optimizer"] != "lionmuon"][cols].isna().all().all()
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+def test_lr_sweep_rows_lionmuon_context_includes_alpha_and_beta2(lion_df, fresh):
+    d = lion_df
+    if not fresh:       # the fallback path: no fresh-seed runs to read the context off
+        d = d[~((d["optimizer"] == "lionmuon") & (d["phase"] == "fresh_seed"))]
+    rows = an._lr_sweep_rows(d, "mlp128", "lionmuon")
+    lrs = [BEST_LR["lionmuon"] * 2 ** (i - 2) for i in range(6)]
+    # exactly the 6 cells of the accepted context.  wd alone does not define
+    # it: the alpha-sweep cells (alpha 3/10/300, beta2 0.99) and the losing
+    # beta2 cell (0.9) share wd=0.03 and the centre lr, and must stay out
+    assert len(rows) == 6
+    assert sorted(rows["lr"]) == pytest.approx(lrs)
+    assert set(rows["lionmuon_alpha"]) == {LION_ACCEPTED["alpha"]}
+    assert set(rows["lionmuon_beta2"]) == {LION_ACCEPTED["beta2"]}
+    assert set(rows["wd"]) == {0.03}
+    best = curve("mlp128", LION_PLANTED["mlp128"] * D1["mlp128"])
+    assert sorted(rows["final_val_loss"]) == pytest.approx(
+        sorted(best + off for off in STAGE_A_OFF["mlp128"]))
+    # the accepted centre was first run inside the beta2 sweep and keeps
+    # that label after dedup; the other five cells are lr-labelled
+    is_centre = np.isclose(rows["lr"], BEST_LR["lionmuon"])
+    assert list(rows[is_centre]["cd_sweep"]) == ["beta2"]
+    assert rows[is_centre]["final_val_loss"].iloc[0] == pytest.approx(best)
+    assert (rows[~is_centre]["cd_sweep"] == "lr").all()
+    # basin: offsets [0.05, 0.010, 0, 0.011, 0.02, 0.20], 1% of ~1.247 = 0.0125
+    # -> cells 1..3 -> 2 factors of 2 (the pass-1 sweep has the same shape,
+    # so the membership asserts above are what tell the contexts apart)
+    assert an.lr_basin_width("mlp128", "lionmuon", d, 0.01) == pytest.approx(2.0)
+    if fresh:
+        assert an._best_lr(d, "mlp128", "lionmuon") == pytest.approx(BEST_LR["lionmuon"])
+
+
+def test_lr_sweep_rows_of_the_other_optimizers_ignore_lionmuon(df, lion_df):
+    for study in ("dense", "mlp128"):
+        for opt in WORLD_OPTS:
+            a = an._lr_sweep_rows(df, study, opt)
+            b = an._lr_sweep_rows(lion_df, study, opt)
+            assert len(a) > 0 and sorted(a["hash"]) == sorted(b["hash"]), (study, opt)
+            tol = 0.01 if study.startswith("mlp") else 0.02
+            assert an.lr_basin_width(study, opt, df, tol) == an.lr_basin_width(
+                study, opt, lion_df, tol)
+
+
+def test_generic_metrics_include_lionmuon(df, lion_df, lion_logs):
+    for study in ("dense", "mlp128"):
+        s = LION_PLANTED[study]
+        tok = an.token_speedup_range(study, lion_df)
+        assert list(tok.index) == list(an.OPTIMIZERS)
+        m = np.asarray(tok.loc["lionmuon", "matrix"], dtype=float)
+        assert m.shape == (3, 3) and np.all(np.abs(m / s - 1) < 0.02), m
+        fl = an.flop_speedup_range(study, lion_df)
+        expected = s * total_rate(study, "adamw") / total_rate(study, "lionmuon")
+        mf = np.asarray(fl.loc["lionmuon", "matrix"], dtype=float)
+        assert np.all(np.abs(mf / expected - 1) < 0.02), (mf, expected)
+        # the other optimizers' speedups do not move
+        base = an.token_speedup_range(study, df)
+        for opt in base.index:
+            assert np.array_equal(np.asarray(base.loc[opt, "matrix"]),
+                                  np.asarray(tok.loc[opt, "matrix"]))
+        ext = an.speedup_extrapolation(study, lion_df)
+        assert not bool(ext.loc["lionmuon", "extrapolated"])    # 1.5x / 1.2x < 2x
+    # dense: 6 stage_a + 6 stage_b + 3 fresh; mlp128: 20 cd + 3 fresh; nothing
+    # diverged or above best + 0.5 nats
+    assert an.divergence_rate("dense", "lionmuon", lion_df) == 0.0
+    assert an.divergence_rate("mlp128", "lionmuon", lion_df) == 0.0
+    assert math.isnan(an.divergence_rate("moe", "lionmuon", lion_df))
+    # one cd cell pushed above best + 0.5 nats: 1 of the 23 mlp128 trials
+    d = lion_df.copy()
+    victim = d[(d["study"] == "mlp128") & (d["optimizer"] == "lionmuon")
+               & (d["cd_sweep"] == "alpha")].index[0]
+    d.loc[victim, "final_val_loss"] += 0.7
+    assert an.divergence_rate("mlp128", "lionmuon", d) == pytest.approx(1 / 23)
+    # planted far ahead of AdamW with a tiny seed spread: not a null result
+    nulls = an.null_result_rows(lion_df)
+    assert "lionmuon" not in set(nulls["optimizer"])
+    pd.testing.assert_frame_equal(nulls, an.null_result_rows(df))
+    # no MoE runs -> no H3 interaction row for it
+    assert "lionmuon" not in an.h3_interaction(lion_df).index
+    # the spectral norms of its fresh seeds are a column like any other
+    _, sn = an.spectral_norm_means(lion_logs, "dense", lion_df)
+    assert list(sn.columns) == list(an.OPTIMIZERS)
+
+
+def test_main_table_gains_lionmuon_rows_and_nothing_else(df, lion_df, tmp_path):
+    base = an.main_table(df, tmp_path / "base").read_text().splitlines()
+    full = an.main_table(lion_df, tmp_path / "lion").read_text().splitlines()
+    assert not any("lionmuon" in l for l in base)
+    added = [l for l in full if l not in base]
+    lost = [l for l in base if l not in full]
+    lm = [l for l in full if l.startswith(("| lionmuon |", "| **lionmuon** |"))]
+    assert len(lm) == 2                                    # mlp128 and dense, not moe
+    # Lion-Muon is planted best in both studies with a clear gap: it is the
+    # bold winner there, so a former bold winner's row loses its bold — the
+    # only lines of the five-optimizer table that change
+    assert all(l.startswith("| **lionmuon** |") for l in lm)
+    assert all(l.startswith("| **") for l in lost)
+    assert sorted(added) == sorted(lm + [l.replace("**", "") for l in lost])
+    for study, row in zip(("mlp128", "dense"), lm):        # Study A section first
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        fr = an._fresh(lion_df, study, "lionmuon")["final_val_loss"]
+        assert cells[1] == f"{fr.mean():.4f} ± {fr.std(ddof=1):.4f}"
+        tok = an.token_speedup_range(study, lion_df).loc["lionmuon"]
+        assert cells[2] == f"[{tok['speedup_min']:.2f}, {tok['speedup_max']:.2f}]"
+        fl = an.flop_speedup_range(study, lion_df).loc["lionmuon"]
+        assert cells[3] == f"[{fl['speedup_min']:.2f}, {fl['speedup_max']:.2f}]"
+        assert cells[4] == "2.00" and cells[5] == "0.0%"
+    # the extrapolation dagger applies to it like to any optimizer
+    text = an.main_table(_beyond_budget(lion_df, "dense", "lionmuon"),
+                         tmp_path / "ext").read_text()
+    mlp_row, dense_row = [l for l in text.splitlines()
+                          if l.startswith(("| lionmuon |", "| **lionmuon** |"))]
+    assert dense_row.count("]" + an.EXTRAPOLATION_MARK) == 2    # token and FLOP range
+    assert an.EXTRAPOLATION_MARK not in mlp_row
+
+
+def test_hypothesis_verdicts_identical_with_and_without_lionmuon(
+        df, logs, lion_df, lion_logs):
+    base = an.hypothesis_verdicts(df, logs)
+    full = an.hypothesis_verdicts(lion_df, lion_logs)
+    pd.testing.assert_frame_equal(base, full)
+    assert base.to_csv(index=False) == full.to_csv(index=False)
+    assert not full["quantity"].str.contains("lionmuon").any()
+    # the fixture can tell: Lion-Muon IS the best dense variant (planted 1.5x,
+    # outside H1's [1.0, 1.4]), so a verdict that let it in would change —
+    # H1 from "supported" to "falsified"
+    assert an._best_variant(lion_df, "dense") == "lionmuon"
+    assert an._best_variant(lion_df, "dense", an.PREREGISTERED_OPTIMIZERS) == "muon"
+    h1 = full[full["hypothesis"] == "H1"].iloc[0]
+    assert h1["verdict"] == "supported" and "best variant muon" in h1["quantity"]
+    assert an.token_speedup_range("dense", lion_df).loc["lionmuon", "speedup_min"] > 1.4
+
+
+def test_h2a_break_even_ignores_lionmuon(df, logs, lion_df, lion_logs):
+    # H2a runs over "every variant" at MLP width >= 256.  The synthetic world
+    # has no such study, so relabel its mlp128 runs as mlp256: Lion-Muon
+    # (speedup 1.2x at 1.05x the FLOPs) beats its break-even there, which
+    # would add a part to the text and violate H2a on its own.
+    def widen(d):
+        return pd.concat([d, d[d["study"] == "mlp128"].assign(study="mlp256")],
+                         ignore_index=True)
+    base = an.hypothesis_verdicts(widen(df), logs)
+    full = an.hypothesis_verdicts(widen(lion_df), lion_logs)
+    pd.testing.assert_frame_equal(base, full)
+    h2a = full[full["hypothesis"] == "H2a"].iloc[0]
+    assert "mlp256/muon" in h2a["quantity"] and "lionmuon" not in h2a["quantity"]
+    assert h2a["verdict"] == "supported"
+    tok = an.token_speedup_range("mlp256", widen(lion_df))
+    be = total_rate("mlp128", "lionmuon") / total_rate("mlp128", "adamw")
+    assert tok.loc["lionmuon", "speedup_min"] > be           # it WOULD violate H2a
+
+
+def test_h3_and_h7_ignore_a_lionmuon_moe_run(df, logs, lion_df, lion_logs, tmp_path):
+    # Lion-Muon is not run on MoE; if it ever were, H3 ("some variant
+    # interacts") and H7 ("the entropy curves separate") must still be about
+    # the five pre-registered optimizers.  Plant MoE Lion-Muon seeds that
+    # would move both: a huge dense-vs-MoE gap and a far-off expert entropy.
+    for seed in (1, 2, 3):
+        cfg = _cfg("moe", "lionmuon", "fresh_seed", seed, BEST_LR["lionmuon"], 0.01,
+                   1.0, **_lion())
+        h, _ = _write_result(tmp_path, cfg, 9.0 + SEED_EPS[seed])
+        _write_log(tmp_path, cfg, h, 9.0)
+    extra, extra_logs = an.load_results(tmp_path), an.load_logs(tmp_path)
+    extra_logs.loc[extra_logs["t"] == "eval", "expert_entropy"] = 0.1
+    d = pd.concat([lion_df, extra], ignore_index=True)
+    lg = pd.concat([lion_logs, extra_logs], ignore_index=True)
+    h3 = an.h3_interaction(d)                   # the generic helper does see it
+    assert bool(h3.loc["lionmuon", "real"]) and h3.loc["lionmuon", "mean_gap_diff"] > 5
+    base = an.hypothesis_verdicts(df, logs)
+    pd.testing.assert_frame_equal(base, an.hypothesis_verdicts(d, lg))
+    h7 = base[base["hypothesis"] == "H7"].iloc[0]["quantity"]
+    assert "final expert entropy" in h7 and "lionmuon" not in h7
+
+
+def test_legacy_figures_render_with_lionmuon(lion_df, lion_logs, tmp_path):
+    for fn in (an.figure_1, an.figure_2, an.figure_4, an.figure_5, an.figure_6,
+               an.figure_7):
+        p = fn(lion_df, tmp_path)
+        assert p.exists() and p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    for fn in (an.figure_3, an.figure_8):
+        p = fn(lion_df, tmp_path, logs=lion_logs)
+        assert p.exists() and p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

@@ -20,8 +20,15 @@ curve with a labelled arrow), Semenov et al. 2509.01440 (small-multiple sweeps).
   | moonlight | Moonlight | `#eda100` | diamond `D` |
   | manifold | Manifold Muon | `#008300` | triangle up `^` |
   | muonall | MuonAll | `#e87ba4` | triangle down `v` |
+  | lionmuon | Lion-Muon | `#6b3fa0` | filled plus `P` |
 
-- Optimizer order is always AdamW, Muon, Moonlight, MuonAll, Manifold Muon.
+- Optimizer order is always AdamW, Muon, Moonlight, MuonAll, Lion-Muon, Manifold Muon.
+- Lion-Muon is the sixth optimizer, added after the protocol freeze (DEVIATIONS #15). It appears
+  in a figure, panel or legend only where it has data: a study without Lion-Muon runs gets no
+  Lion-Muon curve, legend entry or (in A8, whose panels carry their own row labels) row. The dot
+  plots that share one set of row labels across panels (F1, F2, F7) keep the row and leave it
+  blank in a panel without runs. The hypotheses H1–H7 never include it
+  (`analysis.PREREGISTERED_OPTIMIZERS`).
 - Study labels: "MLP-128", "MLP-256", "MLP-512", "Dense transformer". Never raw ids.
 - Width ramp (when width is the series): one hue, light to dark = 128, 256, 512
   (`#86b6ef`, `#2a78d6`, `#0d366b`).
@@ -71,27 +78,33 @@ second row zoomed on the last 25%. Direct end labels where they do not collide, 
 **F4b `f4b_loss_curves_flops`**: same, x = cumulative FLOPs (log x), so Manifold Muon's cost is
 visible without squashing the others.
 
-**F5 `f5_width_transfer` — Does the optimal LR move with width? (H4)** One row of 5 panels (one
-per optimizer). x = learning rate (log2), y = final val loss, one curve per MLP width (width ramp,
+**F5 `f5_width_transfer` — Does the optimal LR move with width? (H4)** One panel per optimizer:
+up to five in one row; six in two rows of three (each row a loss panel over its basin panel), so
+a panel stays legible at the 7.2 in width. x = learning rate (log2), y = final val loss, one curve per MLP width (width ramp,
 light→dark), headline tuning data (seed 0 lr sweep: `cd` rows with `cd_sweep == "lr"` plus the
 accepted centre), a filled marker with dark edge on each curve's minimum, and a short vertical
 tick or arrow annotation showing the shift between the 128 and 512 optimum ("÷2" for AdamW,
 "no shift" where equal). Shared y within the figure is not required (losses differ by width):
 instead plot **loss minus that curve's minimum** in a second row so basin shapes are comparable
 (TP5 variant), y clipped at ~0.15. **F5b `f5b_optimal_lr_vs_width`**: small-multiples summary,
-one panel per optimizer (shared log2 y), x = width (ticks exactly 128/256/512), re-tuned optimum
+one panel per optimizer in one row (shared log2 y), x = width (ticks exactly 128/256/512), re-tuned optimum
 (solid, filled) and inherited-track optimum (dashed, hollow; `analysis.inherited_best_lr`). No
 dodging: the two tracks coincide where they coincide.
 
 **F6 `f6_hparam_sensitivity_<study>` — Hyperparameter sensitivity (coordinate descent).** One
-figure per study with CD data (mlp128, mlp256, mlp512, dense). Grid: rows = optimizers (5),
-columns = hyperparameters (learning rate, weight decay, momentum / β1, β2, gradient clip).
-Each cell: x = the hyperparameter value (log x for lr; categorical-evenly-spaced for wd incl. 0,
+figure per study with CD data (mlp128, mlp256, mlp512, dense). Grid: rows = optimizers,
+columns = hyperparameters (learning rate, weight decay, momentum / β1, β2, gradient clip), plus —
+only when Lion-Muon is in the grid — a column α = Muon LR ÷ sign LR after weight decay (the
+coordinate-descent order). Lion-Muon's β2 (its EMA decay) is drawn in the β2 column; it has no
+momentum. With six columns the titles take two lines and the x tick labels are 7 pt.
+Each cell: x = the hyperparameter value (log x for lr and for α, where every tested value has a
+tick and every other one a label; categorical-evenly-spaced for wd incl. 0,
 momentum, β2, clip incl. "none"), y = final val loss − best loss for that optimizer (≥ 0), points
 joined by a line in the optimizer colour; the accepted value marked with a star; a light grey
 band from 0 to the acceptance threshold (2 × pilot seed std for that study — get it from the
 pilot rows / `studies` helper) labelled once "noise". Cells for hyperparameters an optimizer does
-not have (e.g. β2 for Muon, wd for Manifold) are blank with a small grey "n/a". y clipped (same
+not have (e.g. β2 for Muon, wd for Manifold, α for all but Lion-Muon) are blank with a small
+grey "n/a". y clipped (same
 limit across a row) with out-of-range points drawn as `^` at the top edge, diverged as `x`.
 Second-pass CD points included. Wen et al. show this only as tables; we show the grid.
 
@@ -141,6 +154,7 @@ mean over fresh seeds.
 
 **A8 `a8_divergence` — Stability.** Per study, per optimizer: the LR range trained without
 divergence, as a horizontal span on a log2 LR axis, with the best LR marked and diverged LRs `x`.
+A study lists only the optimizers that have tuning runs in it.
 
 MoE figures (expert entropy, dense-vs-MoE interaction) are not drawn until MoE fresh seeds exist;
 `figures.py` must skip them cleanly and say so on stdout.
@@ -152,7 +166,8 @@ MoE figures (expert entropy, dense-vs-MoE interaction) are not drawn until MoE f
   returning DataFrames (tested), and `main()` that builds all and prints one line per figure
   (written or skipped + reason). No training, no writes outside `outdir`.
 - The old `analysis.figure_1..8` stay (tests depend on them) but are no longer the report figures.
-- Tests (`tests/test_figures.py`): style table complete and fixed; each data helper on synthetic
+- Tests (`tests/test_figures.py`): style table complete and fixed (six optimizers); every
+  figure with and without Lion-Muon data; each data helper on synthetic
   frames (reuse fixtures in tests/test_analysis.py); every figure function renders on the
   synthetic fixtures without error and writes its files; markers in F5b sit exactly on the widths;
   inherited-track rows never enter headline helpers; parked/partial runs never counted.
