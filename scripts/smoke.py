@@ -61,7 +61,7 @@ def smoke_config(study: str, opt: str, steps: int, dual_cap: int | None = None) 
     group uses AdamW's literature defaults (tuning has not happened yet)."""
     sv = studies.load_study(study)
     group = None
-    if opt in ("muon", "manifold"):
+    if opt in studies.AUX_ADAMW_OPTIMIZERS:
         group = (float(sv["optimizers"]["adamw"]["lr"]),
                  float(sv["optimizers"]["adamw"]["wd"]))
     ev = dict(sv["eval"], every_steps=EVAL_EVERY)
@@ -143,7 +143,7 @@ def main(argv=None) -> int:
     csv_path = args.csv or (args.root / "hardware-results.csv")
     sv = studies.load_study(args.study)
 
-    # (optimizer, cap) units: the 5 optimizers at their default settings,
+    # (optimizer, cap) units: every optimizer at its default settings,
     # plus Manifold at cap 10 while the cap is undecided (Gate-0 answer 13).
     default_cap = int(sv["optimizers"]["manifold"].get("dual_cap", 5))
     units: list[tuple[str, int | None]] = [

@@ -67,7 +67,7 @@ def test_timing_compute_estimate_from_synthetic_csv(tmp_path):
     timing = _load_script("timing")
     rows = []
     for study in studies.STUDIES:
-        for opt in ("adamw", "muon", "moonlight", "muonall"):
+        for opt in ("adamw", "muon", "moonlight", "muonall", "lionmuon"):
             rows.append({"study": study, "optimizer": opt, "cap": "",
                          "s_per_step": 0.0})
         rows.append({"study": study, "optimizer": "manifold", "cap": 5,
@@ -140,12 +140,12 @@ def test_smoke_continues_past_failed_unit(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "FAILED mlp128/muon" in err and "1 unit(s) FAILED" in err
     # the units after the failed one still executed: adamw, moonlight,
-    # manifold (cap 5), muonall, manifold (cap 10) -> 5 timed pairs
+    # manifold (cap 5), muonall, lionmuon, manifold (cap 10) -> 6 timed pairs
     with csv_path.open() as f:
         timed = list(csv.DictReader(f))
     assert [(r["optimizer"], r["cap"]) for r in timed] == [
         ("adamw", ""), ("moonlight", ""), ("manifold", "5"),
-        ("muonall", ""), ("manifold", "10")]
+        ("muonall", ""), ("lionmuon", ""), ("manifold", "10")]
     assert all(r["study"] == "mlp128" for r in timed)
     # each unit ran a 20-step and a 200-step smoke config
     assert sorted({c["budget_base_steps"] for c in executed}) == [20, 200]

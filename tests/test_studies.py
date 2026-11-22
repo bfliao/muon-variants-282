@@ -86,7 +86,9 @@ def driver(monkeypatch):
 
 def test_studies_and_optimizers():
     assert studies.STUDIES == ("mlp128", "mlp256", "mlp512", "dense", "moe")
-    assert studies.OPTIMIZERS == ("adamw", "muon", "moonlight", "manifold", "muonall")
+    assert studies.OPTIMIZERS == ("adamw", "muon", "moonlight", "manifold", "muonall",
+                                  "lionmuon")
+    assert studies.AUX_ADAMW_OPTIMIZERS == ("muon", "manifold", "lionmuon")
     assert studies.PHASE1_STUDIES == ("mlp128", "dense")
     assert studies.PHASE2_DONOR == {"mlp256": "mlp128", "mlp512": "mlp128",
                                     "moe": "dense"}
@@ -202,7 +204,11 @@ def test_phase2_donor_gates_stage_a(tmp_path):
 # ---------------------------------------------------------------- cd sweeps
 
 def test_cd_sweep_order_grids_and_no_warmup(tmp_path):
-    assert studies.CD_ORDER == ("lr", "wd", "momentum", "beta2", "clip")
+    assert studies.CD_ORDER == ("lr", "wd", "alpha", "momentum", "beta2", "clip")
+    # the five pre-Lion-Muon optimizers sweep exactly what they always did
+    assert studies.cd_hypers("moonlight") == ("lr", "wd", "momentum", "clip")
+    assert studies.cd_hypers("muonall") == ("lr", "wd", "momentum", "clip")
+    assert studies.cd_hypers("lionmuon") == ("lr", "wd", "alpha", "momentum", "clip")
     assert studies.cd_hypers("adamw") == ("lr", "wd", "momentum", "beta2", "clip")
     assert studies.cd_hypers("muon") == ("lr", "wd", "momentum", "clip")
     assert studies.cd_hypers("manifold") == ("lr", "momentum", "clip")  # no wd
@@ -400,7 +406,7 @@ def test_edge_rule_never_fires_on_wd(tmp_path):
 def finish_phase1(root, study, loss_fn=lambda cfg: 1.0):
     plant_pilot(root, study)
     complete_cd(root, study, "adamw", loss_fn)
-    for opt in ("muon", "moonlight", "manifold", "muonall"):
+    for opt in ("muon", "moonlight", "manifold", "muonall", "lionmuon"):
         complete_cd(root, study, opt, loss_fn)
 
 
@@ -597,12 +603,14 @@ def test_every_generated_config_hashes_cleanly(tmp_path, driver):
     runner.Runner(tmp_path).run_study("mlp128")
     assert len(calls) > 90
     for cfg in calls:
-        assert set(runner.HASHED_FIELDS) <= set(cfg)
+        # "lionmuon" (hashed only when set) is carried by lionmuon runs only
+        assert set(runner.HASHED_FIELDS) - set(runner.OMITTED_WHEN_NULL) <= set(cfg)
+        assert ("lionmuon" in cfg) == (cfg["optimizer"] == "lionmuon")
         h = runner.config_hash(cfg)
         assert len(h) == 12
         if cfg["phase"] == "cd":
             assert "cd_sweep" in cfg
-        if cfg["optimizer"] in ("muon", "manifold"):
+        if cfg["optimizer"] in ("muon", "manifold", "lionmuon"):
             assert cfg["adamw_group_lr"] is not None
             assert cfg["adamw_group_wd"] is not None
         else:
@@ -615,9 +623,21 @@ def test_planned_job_counts_no_edge_scenario():
     counts = {s: len(studies.planned_jobs(s)) for s in studies.STUDIES}
     # mlp256/mlp512 run both tracks (DEVIATIONS.md #12): +64 cd jobs each,
     # +3 pilot runs at mlp256
-    assert counts == {"mlp128": 101, "mlp256": 161, "mlp512": 161,
-                      "dense": 101, "moe": 94}
-    assert sum(counts.values()) == 618
+    before_lionmuon = {"mlp128": 101, "mlp256": 161, "mlp512": 161,
+                       "dense": 101, "moe": 94}
+    old = {s: sum(c["optimizer"] != "lionmuon" for c in studies.planned_jobs(s))
+           for s in studies.STUDIES}
+    assert old == before_lionmuon and sum(old.values()) == 618
+    # Lion-Muon adds, per study: cd 17 (lr 6 + wd 3 + alpha 4 + beta2 2 +
+    # clip 2 new cells; the incumbent is shared) + 3 fresh seeds = 20 where
+    # there is a coordinate descent; Stage A 6 + Stage B 6 = 12 on the
+    # inherited track (mlp256/mlp512 run both: 32; moe: 12 + 3 fresh = 15).
+    # No faithful rerun and no init ablation for lionmuon.
+    lion = {s: counts[s] - old[s] for s in studies.STUDIES}
+    assert lion == {"mlp128": 20, "mlp256": 32, "mlp512": 32, "dense": 20, "moe": 15}
+    assert counts == {"mlp128": 121, "mlp256": 193, "mlp512": 193,
+                      "dense": 121, "moe": 109}
+    assert sum(counts.values()) == 737
 
 
 # ---------------------------------------------------------------- exclusion
@@ -653,9 +673,10 @@ def test_exclude_optimizers_drops_only_that_chain(tmp_path, moe_without_manifold
              if "_cd_" not in p.name and p.name != "pilot"}
     assert other - names == with_m
     assert names <= other
-    # planned enumeration honors the exclusion: 94 - 16 manifold jobs
+    # planned enumeration honors the exclusion: 109 - 16 manifold jobs
+    # (94 before Lion-Muon, + 15 lionmuon jobs)
     jobs = studies.planned_jobs("moe")
-    assert len(jobs) == 78
+    assert len(jobs) == 93
     assert all(j["optimizer"] != "manifold" for j in jobs)
 
 
@@ -664,10 +685,10 @@ def test_exclude_optimizers_no_deadlock(tmp_path, moe_without_manifold, driver):
     completion and schedules no manifold job in moe."""
     calls = driver()
     r = runner.Runner(tmp_path)
-    r.run_study("dense")          # donor: full 101-run Phase-I study
+    r.run_study("dense")          # donor: full 121-run Phase-I study
     n = r.run_study("moe")
     moe_calls = [c for c in calls if c["study"] == "moe"]
-    assert n == len(moe_calls) == 78
+    assert n == len(moe_calls) == 93
     assert all(c["optimizer"] != "manifold" for c in moe_calls)
     for phase, ready, cfgs, pending, mine in r._survey("moe"):
         assert ready and not pending, phase.name
@@ -740,7 +761,7 @@ def test_trial_counts(tmp_path):
         seed=1))
     counts = studies.trial_counts(view_of(tmp_path), "mlp128")
     assert counts == {"adamw": 6, "muon": 1, "moonlight": 0,
-                      "manifold": 0, "muonall": 1}
+                      "manifold": 0, "muonall": 1, "lionmuon": 0}
     assert studies.trial_counts(view_of(tmp_path), "dense") == dict.fromkeys(
         studies.OPTIMIZERS, 0)
 
@@ -769,7 +790,7 @@ def test_full_retune_dag_has_both_tracks(study, tmp_path):
     for opt in studies.OPTIMIZERS:
         assert dag[f"{opt}_fresh"].needs == (f"{opt}_cd_p2_clip",)
     assert dag["budget_constant"].needs == ("adamw_fresh",)
-    assert len([n for n in dag if n.endswith("_fresh")]) == 5
+    assert len([n for n in dag if n.endswith("_fresh")]) == 6
 
 
 def test_full_retune_cd_uses_own_pilot_and_tracks_keep_own_adamw_group(tmp_path):
@@ -865,3 +886,230 @@ def test_trial_counts_tracks_never_summed(tmp_path):
     assert inh["adamw"] == 6          # Stage A only so far
     with pytest.raises(ValueError):
         studies.trial_counts(v, "mlp256", track="both")
+
+
+# ---------------------------------------------------------------- Lion-Muon
+# Sixth optimizer: split and AdamW-group gating like muon; tuned by the same
+# coordinate descent over lr, wd, alpha, beta2 (its "momentum" slot), clip;
+# period 5 and beta1 0.9 fixed. No faithful rerun, no init ablation.
+
+LION = {"period": 5, "alpha": 30.0, "beta1": 0.9, "beta2": 0.99}
+
+
+def test_lionmuon_yaml_defaults_in_every_study():
+    for study in studies.STUDIES:
+        d = studies.load_study(study)["optimizers"]["lionmuon"]
+        assert d == {"lr": 1e-3, "wd": 0.1, "alpha": 30, "beta1": 0.9,
+                     "beta2": 0.99, "period": 5}, study
+        sv = studies.load_study(study)
+        assert studies.cd_defaults(sv, "lionmuon") == {
+            "lr": 1e-3, "wd": 0.1, "momentum": None, "beta1": 0.9,
+            "beta2": 0.99, "clip": 1.0, "alpha": 30.0}
+        # the other optimizers' states did not grow an alpha key
+        for opt in ("adamw", "muon", "moonlight", "manifold", "muonall"):
+            assert set(studies.cd_defaults(sv, opt)) == {
+                "lr", "wd", "momentum", "beta1", "beta2", "clip"}
+
+
+def test_lionmuon_run_config_identity_fields():
+    sv = studies.load_study("mlp128")
+    vals = studies.cd_defaults(sv, "lionmuon")
+    with pytest.raises(ValueError):                       # needs AdamW's winner
+        studies.run_config(sv, "lionmuon", "cd", vals)
+    cfg = studies.run_config(sv, "lionmuon", "cd", vals, adamw_group=(2e-3, 0.03))
+    assert cfg["optimizer"] == "lionmuon" and cfg["rule"] == "moonlight"
+    assert cfg["momentum"] is None
+    assert cfg["adamw_betas"] == [0.9, 0.95]
+    assert (cfg["adamw_group_lr"], cfg["adamw_group_wd"]) == (2e-3, 0.03)
+    assert (cfg["lr"], cfg["wd"]) == (1e-3, 0.1)
+    assert (cfg["ns_steps"], cfg["ns_dtype"]) == (5, "fp32")
+    assert cfg["manifold"] is None and cfg["init_projection"] is False
+    assert cfg["lionmuon"] == LION
+    assert all(isinstance(cfg["lionmuon"][k], float) for k in ("alpha", "beta1", "beta2"))
+    assert set(runner.HASHED_FIELDS) <= set(cfg)
+    # tuned values flow into the hashed dict
+    cfg2 = studies.run_config(sv, "lionmuon", "cd", dict(vals, alpha=100.0, beta2=0.95),
+                              adamw_group=(2e-3, 0.03))
+    assert cfg2["lionmuon"] == dict(LION, alpha=100.0, beta2=0.95)
+    assert runner.config_hash(cfg2) != runner.config_hash(cfg)
+
+
+@pytest.mark.parametrize("study", ["mlp128", "dense"])
+def test_lionmuon_dag_phase1(study, tmp_path):
+    dag = _dag_by_name(study, tmp_path)
+    names = [n for n in dag if n.startswith("lionmuon_")]
+    assert names == [
+        "lionmuon_cd_p1_lr", "lionmuon_cd_p1_lr_edge", "lionmuon_cd_p1_wd",
+        "lionmuon_cd_p1_alpha", "lionmuon_cd_p1_momentum", "lionmuon_cd_p1_clip",
+        "lionmuon_cd_p2_lr", "lionmuon_cd_p2_lr_edge", "lionmuon_cd_p2_wd",
+        "lionmuon_cd_p2_alpha", "lionmuon_cd_p2_momentum", "lionmuon_cd_p2_clip",
+        "lionmuon_fresh",
+    ]
+    # waits on AdamW's whole chain, like muon and manifold
+    assert set(dag["lionmuon_cd_p1_lr"].needs) == {"pilot", "adamw_cd_p2_clip"}
+    assert dag["lionmuon_cd_p1_alpha"].needs == ("lionmuon_cd_p1_wd",)
+    assert dag["lionmuon_cd_p1_momentum"].needs == ("lionmuon_cd_p1_alpha",)
+    assert dag["lionmuon_fresh"].needs == ("lionmuon_cd_p2_clip",)
+    assert "lionmuon_faithful" not in dag            # no faithful rerun
+    assert dag["init_ablation"].needs == ("muon_fresh",)   # still Muon's only
+
+
+@pytest.mark.parametrize("study", ["mlp256", "mlp512"])
+def test_lionmuon_dag_full_retune(study, tmp_path):
+    dag = _dag_by_name(study, tmp_path)
+    names = {n for n in dag if n.startswith("lionmuon_")}
+    cd = {n for n in _dag_by_name("mlp128", tmp_path) if n.startswith("lionmuon_")}
+    assert names == cd | {"lionmuon_stage_a", "lionmuon_edge", "lionmuon_stage_b",
+                          "lionmuon_edge_b"}
+    assert dag["lionmuon_stage_a"].needs == ("adamw_edge_b",)
+    assert dag["lionmuon_fresh"].needs == ("lionmuon_cd_p2_clip",)
+
+
+def test_lionmuon_dag_moe(tmp_path):
+    dag = _dag_by_name("moe", tmp_path)
+    assert [n for n in dag if n.startswith("lionmuon_")] == [
+        "lionmuon_stage_a", "lionmuon_edge", "lionmuon_stage_b",
+        "lionmuon_edge_b", "lionmuon_fresh"]
+    assert dag["lionmuon_stage_a"].needs == ("adamw_edge_b",)
+    assert not dag["lionmuon_stage_a"].is_ready()     # donor (dense) not done
+
+
+def test_adding_lionmuon_leaves_the_other_dag_phases_alone(tmp_path):
+    """Phase names, order and needs of everything that is not lionmuon's."""
+    for study in studies.STUDIES:
+        phases = [p for p in studies.build_dag(study, view_of(tmp_path))
+                  if not p.name.startswith("lionmuon_")]
+        for p in phases:
+            assert not any(n.startswith("lionmuon_") for n in p.needs), p.name
+        opts = {p.name.split("_")[0] for p in phases} - {"pilot", "budget", "init"}
+        assert opts == {"adamw", "muon", "moonlight", "manifold", "muonall"}
+
+
+def test_lionmuon_waits_on_adamw_winner_and_uses_it(tmp_path):
+    plant_pilot(tmp_path, "mlp128", (1.0, 1.01, 1.02))
+    assert studies.cd_replay("mlp128", "lionmuon", view_of(tmp_path)).blocked
+    d = 1e-3
+    complete_cd(tmp_path, "mlp128", "adamw",
+                lambda c: 0.5 if math.isclose(c["lr"], 2 * d) else 1.0)
+    rep = studies.cd_replay("mlp128", "lionmuon", view_of(tmp_path))
+    assert not rep.blocked
+    cfgs = rep.sweeps["p1_lr"].configs
+    assert len(cfgs) == 6
+    for cfg in cfgs:
+        assert cfg["adamw_group_lr"] == pytest.approx(2 * d)   # AdamW's winner
+        assert cfg["adamw_group_wd"] == pytest.approx(0.1)
+        assert cfg["wd"] == pytest.approx(0.1)                 # its own wd
+        assert cfg["lionmuon"] == LION and cfg["cd_sweep"] == "lr"
+    assert sorted(c["lr"] for c in cfgs) == pytest.approx(
+        [1e-3 * 2.0 ** k for k in studies.LR_GRID_KS])
+
+
+def _plant_sweep(root, study, opt, key, loss_fn=lambda c: 1.0):
+    rep = studies.cd_replay(study, opt, view_of(root))
+    ss = rep.sweeps[key]
+    assert ss.configs, key
+    for c in ss.configs:
+        plant(root, c, loss_fn(c))
+    return ss.configs
+
+
+def test_lionmuon_cd_sweeps_alpha_and_beta2(tmp_path):
+    plant_pilot(tmp_path, "mlp128", (1.0, 1.01, 1.02))
+    complete_cd(tmp_path, "mlp128", "adamw")
+    _plant_sweep(tmp_path, "mlp128", "lionmuon", "p1_lr")
+    wd = _plant_sweep(tmp_path, "mlp128", "lionmuon", "p1_wd")
+    assert sorted(c["wd"] for c in wd) == pytest.approx([0.0, 0.03, 0.1, 0.3])
+    assert {c["adamw_group_wd"] for c in wd} == {0.1}   # AdamW group unaffected
+
+    # alpha: the 5 grid values, incumbent (30) first, sitting at the centre
+    alpha = _plant_sweep(tmp_path, "mlp128", "lionmuon", "p1_alpha",
+                         lambda c: 0.5 if c["lionmuon"]["alpha"] == 100.0 else 1.0)
+    values = [c["lionmuon"]["alpha"] for c in alpha]
+    assert values[0] == 30.0
+    assert sorted(values) == [3.0, 10.0, 30.0, 100.0, 300.0]
+    assert sorted(values)[len(values) // 2] == 30.0
+    assert {c["cd_sweep"] for c in alpha} == {"alpha"}
+    for c in alpha:                                      # one coordinate moves
+        assert (c["lr"], c["wd"], c["grad_clip"]) == (1e-3, 0.1, 1.0)
+        assert c["lionmuon"] == dict(LION, alpha=c["lionmuon"]["alpha"])
+        assert c["momentum"] is None
+
+    # alpha = 100 won by far more than 2 x pilot std: accepted, and the next
+    # sweep is beta2 (the "momentum" slot) at the new alpha
+    rep = studies.cd_replay("mlp128", "lionmuon", view_of(tmp_path))
+    assert rep.state["alpha"] == 100.0
+    assert rep.sweeps["p1_alpha"].edge_complete          # no edge rule on alpha
+    assert rep.sweeps["p1_alpha"].edge_configs == []
+    b2 = rep.sweeps["p1_momentum"].configs
+    assert [c["lionmuon"]["beta2"] for c in b2][0] == 0.99    # incumbent first
+    assert sorted(c["lionmuon"]["beta2"] for c in b2) == [0.9, 0.95, 0.99]
+    assert {c["cd_sweep"] for c in b2} == {"beta2"}
+    assert {c["lionmuon"]["alpha"] for c in b2} == {100.0}
+    assert {c["lionmuon"]["beta1"] for c in b2} == {0.9}      # never swept
+    assert {c["lionmuon"]["period"] for c in b2} == {5}
+    assert {tuple(c["adamw_betas"]) for c in b2} == {(0.9, 0.95)}
+
+    rep = complete_cd(tmp_path, "mlp128", "lionmuon",
+                      lambda c: 0.5 if c["lionmuon"]["alpha"] == 100.0 else 1.0)
+    assert rep.state["alpha"] == 100.0 and rep.state["beta2"] == 0.99
+    # pass 2 ran (pass 1 accepted alpha); its alpha sweep is centred on 100
+    p2 = rep.sweeps["p2_alpha"].configs
+    assert [c["lionmuon"]["alpha"] for c in p2][0] == 100.0
+    assert sorted(c["lionmuon"]["alpha"] for c in p2) == [3.0, 10.0, 30.0, 100.0, 300.0]
+    best = studies.best_config("mlp128", "lionmuon", view_of(tmp_path))
+    assert best["lionmuon"] == dict(LION, alpha=100.0)
+    fresh = studies.fresh_seed_configs("mlp128", "lionmuon", view_of(tmp_path))
+    assert [c["seed"] for c in fresh] == [1, 2, 3]
+    assert all(c["lionmuon"] == best["lionmuon"] and c["phase"] == "fresh_seed"
+               for c in fresh)
+    # no faithful rerun, no init ablation for lionmuon
+    assert all(c["optimizer"] != "lionmuon"
+               for c in studies.faithful_configs("mlp128", view_of(tmp_path)))
+    assert studies.init_ablation_configs("mlp128", view_of(tmp_path)) == []
+
+
+def test_lionmuon_alpha_edge_never_fires(tmp_path):
+    """Edge extension stays lr-only: alpha winning on the grid edge (300)
+    generates no trial beyond it."""
+    plant_pilot(tmp_path, "mlp128", (1.0, 1.01, 1.02))
+    complete_cd(tmp_path, "mlp128", "adamw")
+    rep = complete_cd(tmp_path, "mlp128", "lionmuon",
+                      lambda c: 0.5 if c["lionmuon"]["alpha"] == 300.0 else 1.0)
+    assert rep.state["alpha"] == 300.0
+    seen = set()
+    for key, ss in rep.sweeps.items():
+        seen |= {c["lionmuon"]["alpha"] for c in ss.configs + ss.edge_configs}
+        if not key.endswith("_lr"):
+            assert ss.edge_configs == []
+    assert seen == {3.0, 10.0, 30.0, 100.0, 300.0}
+
+
+def test_lionmuon_phase2_inherits_alpha_and_beta2(tmp_path):
+    plant_pilot(tmp_path, "mlp128", (1.0, 1.01, 1.02))
+    complete_cd(tmp_path, "mlp128", "adamw")
+    assert studies.inherited_values("mlp256", "lionmuon", view_of(tmp_path)) is None
+
+    def donor_loss(c):
+        lm = c["lionmuon"]
+        return 1.0 - 0.3 * (lm["alpha"] == 10.0) - 0.3 * (lm["beta2"] == 0.95)
+
+    complete_cd(tmp_path, "mlp128", "lionmuon", donor_loss)
+    vals = studies.inherited_values("mlp256", "lionmuon", view_of(tmp_path))
+    assert vals["alpha"] == 10.0 and vals["beta2"] == 0.95     # from the donor
+    assert vals["lr"] == pytest.approx(1e-3) and vals["wd"] == pytest.approx(0.1)
+    # Stage A needs this study's AdamW Phase-II winner for the AdamW group
+    assert studies._stage_cells("mlp256", "lionmuon", view_of(tmp_path)) is None
+    _finish_stage_a(tmp_path, "mlp256", "adamw")
+    sb = studies._stage_b_cells("mlp256", "adamw", view_of(tmp_path))
+    for _, c in sb[0]:
+        plant(tmp_path, c)
+    st = studies._stage_cells("mlp256", "lionmuon", view_of(tmp_path))
+    assert st is not None
+    cells = [c for _, c in st[0]]
+    assert len(cells) == 6
+    assert sorted(c["lr"] for c in cells) == pytest.approx(
+        studies.stage_a_grid("mlp256", "lionmuon"))
+    for c in cells:
+        assert c["phase"] == "stage_a"
+        assert c["lionmuon"] == dict(LION, alpha=10.0, beta2=0.95)
+        assert c["adamw_group_lr"] is not None and c["adamw_group_wd"] is not None

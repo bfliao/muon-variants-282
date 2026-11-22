@@ -27,7 +27,8 @@ Implements design.md §3.10, §5 and §6, adapted to the final module reality:
 
 * ``cd_sweep`` — every Phase-I coordinate-descent config carries a
   ``cd_sweep`` field naming the swept hyperparameter ("lr", "wd", "momentum",
-  "beta1", "beta2", "clip"); analysis._lr_sweep_rows selects the lr sweep by
+  "beta1", "beta2", "clip"; "alpha" for Lion-Muon, whose "beta2" label is
+  its EMA decay); analysis._lr_sweep_rows selects the lr sweep by
   ``cd_sweep == "lr"``. DECISION: cd_sweep is NOT hashed (it is not in
   runner.HASHED_FIELDS, which the identity review froze). Consequence: when a
   later sweep or pass revisits an identical configuration (e.g. the incumbent
@@ -91,6 +92,7 @@ from muonarch.schedule import CHECKPOINT_FRACTIONS, checkpoint_step
 __all__ = [
     "STUDIES",
     "OPTIMIZERS",
+    "AUX_ADAMW_OPTIMIZERS",
     "PHASE1_STUDIES",
     "PHASE2_DONOR",
     "PILOT_STUDIES",
@@ -128,7 +130,12 @@ __all__ = [
 SCHEMA_VERSION = 1
 
 STUDIES: tuple[str, ...] = ("mlp128", "mlp256", "mlp512", "dense", "moe")
-OPTIMIZERS: tuple[str, ...] = ("adamw", "muon", "moonlight", "manifold", "muonall")
+OPTIMIZERS: tuple[str, ...] = ("adamw", "muon", "moonlight", "manifold", "muonall",
+                               "lionmuon")
+#: Optimizers whose auxiliary AdamW group runs at AdamW's tuned (lr, wd) for
+#: the study (Gate-0 answer 12; Lion-Muon joins Muon and Manifold): their
+#: configs REQUIRE adamw_group, and their tuning chains wait on AdamW's.
+AUX_ADAMW_OPTIMIZERS: tuple[str, ...] = ("muon", "manifold", "lionmuon")
 
 PHASE1_STUDIES: tuple[str, ...] = ("mlp128", "dense")
 PHASE2_DONOR: dict[str, str] = {"mlp256": "mlp128", "mlp512": "mlp128", "moe": "dense"}
@@ -148,7 +155,10 @@ PILOT_SEEDS: tuple[int, ...] = (101, 102, 103)  # Gate-0 answer 6
 
 #: Phase-I coordinate-descent sweep order. NO warmup — fixed at 5% of the 1x
 #: budget for every optimizer and every run (Gate 1, DEVIATIONS.md #6).
-CD_ORDER: tuple[str, ...] = ("lr", "wd", "momentum", "beta2", "clip")
+#: "alpha" is swept by Lion-Muon only (cd_hypers), so the other optimizers'
+#: sweeps and their order are exactly ("lr", "wd", "momentum", "beta2", "clip")
+#: restricted as before.
+CD_ORDER: tuple[str, ...] = ("lr", "wd", "alpha", "momentum", "beta2", "clip")
 
 LR_GRID_KS: tuple[int, ...] = (-3, -2, -1, 0, 1, 2)   # 6 points, spans 32x
 WD_FACTORS: tuple[float, ...] = (0.0, 0.3, 1.0, 3.0)  # x plain default d
@@ -157,11 +167,16 @@ MOMENTUM_GRID: tuple[float, ...] = (0.9, 0.95, 0.98)  # Muon family
 BETA1_GRID: tuple[float, ...] = (0.8, 0.9, 0.95)      # AdamW
 BETA2_GRID: tuple[float, ...] = (0.95, 0.99, 0.999)   # AdamW only
 CLIP_GRID: tuple[Optional[float], ...] = (None, 0.5, 1.0)
+#: Lion-Muon only. alpha = Muon-step lr / sign-step lr (the reference's main
+#: grid); its "momentum" slot is beta2, the decay of the shared EMA buffer.
+#: Fixed grids, like momentum/clip: no edge extension (edge rule is lr-only).
+LIONMUON_ALPHA_GRID: tuple[float, ...] = (3.0, 10.0, 30.0, 100.0, 300.0)
+LIONMUON_BETA2_GRID: tuple[float, ...] = (0.9, 0.95, 0.99)
 QUARTER_OCTAVE_KS: tuple[float, ...] = (-0.75, -0.5, -0.25, 0.25, 0.5, 0.75)
 MAX_EDGE_TRIALS = 2
 
 _RULES = {"adamw": None, "muon": "keller", "moonlight": "moonlight",
-          "manifold": None, "muonall": "keller"}
+          "manifold": None, "muonall": "keller", "lionmuon": "moonlight"}
 
 # ---------------------------------------------------------------------------
 # final-seed count (Gate-0 answer 6: ONE count for all five studies)
@@ -276,8 +291,20 @@ class ResultsView:
 
 def cd_defaults(sv: dict, opt: str) -> dict:
     """The literature-default tunable-value state for one optimizer:
-    {"lr", "wd", "momentum", "beta1", "beta2", "clip"}."""
+    {"lr", "wd", "momentum", "beta1", "beta2", "clip"}. Lion-Muon's state
+    has no Nesterov momentum (None), carries its EMA decay as "beta2" and
+    one extra key, "alpha"; the other optimizers' states are unchanged."""
     d = sv["optimizers"][opt]
+    if opt == "lionmuon":
+        return {
+            "lr": float(d["lr"]),
+            "wd": float(d["wd"]),
+            "momentum": None,
+            "beta1": float(d["beta1"]),   # fixed, never swept
+            "beta2": float(d["beta2"]),
+            "clip": sv.get("grad_clip", 1.0),
+            "alpha": float(d["alpha"]),
+        }
     return {
         "lr": float(d["lr"]),
         "wd": None if d.get("wd") is None else float(d["wd"]),
@@ -295,11 +322,16 @@ def run_config(sv: dict, opt: str, phase: str, values: dict, *, seed: int = 0,
     constants copied from the yaml and the tunable ``values`` applied.
 
     ``adamw_group`` = (lr, wd) of AdamW's tuned winner for this study — REQUIRED
-    for muon and manifold (their auxiliary AdamW group, Gate-0 answer 12),
-    forbidden otherwise. ``over`` overrides top-level fields (faithful reruns,
-    budgets, branches, smoke worlds...).
+    for muon, manifold and lionmuon (their auxiliary AdamW group, Gate-0
+    answer 12), forbidden otherwise. ``over`` overrides top-level fields
+    (faithful reruns, budgets, branches, smoke worlds...).
+
+    The hashed "lionmuon" field ({"period", "alpha", "beta1", "beta2"}) is
+    set for lionmuon configs ONLY; every other optimizer's config does not
+    carry the key at all, so those configs — and their hashes — are exactly
+    what they were before Lion-Muon existed (runner.canonical).
     """
-    if opt in ("muon", "manifold"):
+    if opt in AUX_ADAMW_OPTIMIZERS:
         if adamw_group is None:
             raise ValueError(f"{opt} configs need adamw_group=(lr, wd)")
         group_lr, group_wd = float(adamw_group[0]), float(adamw_group[1])
@@ -326,7 +358,8 @@ def run_config(sv: dict, opt: str, phase: str, values: dict, *, seed: int = 0,
         "rule": _RULES[opt],
         "lr": float(values["lr"]),
         "wd": None if opt == "manifold" else float(values["wd"]),
-        "momentum": None if opt == "adamw" else float(values["momentum"]),
+        "momentum": (None if opt in ("adamw", "lionmuon")
+                     else float(values["momentum"])),
         "adamw_betas": ([float(values["beta1"]), float(values["beta2"])]
                         if opt == "adamw" else [0.9, 0.95]),
         "adamw_eps": float(sv["optimizers"]["adamw"].get("eps", 1e-8)),
@@ -350,6 +383,14 @@ def run_config(sv: dict, opt: str, phase: str, values: dict, *, seed: int = 0,
         "eval": dict(sv["eval"]),
         "data": dict(sv["data"]),
     }
+    if opt == "lionmuon":
+        lm = sv["optimizers"]["lionmuon"]
+        cfg["lionmuon"] = {
+            "period": int(lm["period"]),       # fixed (reference default)
+            "alpha": float(values["alpha"]),
+            "beta1": float(lm["beta1"]),       # fixed
+            "beta2": float(values["beta2"]),
+        }
     cfg.update(over)
     if cd_sweep is not None:
         cfg["cd_sweep"] = cd_sweep  # logged in the result config, NOT hashed
@@ -386,10 +427,13 @@ def pilot_seed_std(study: str, view: ResultsView, config_dir=None) -> float | No
 
 def cd_hypers(opt: str) -> tuple[str, ...]:
     """CD_ORDER restricted to the hypers this optimizer tunes. ``momentum``
-    means beta1 for adamw; manifold skips wd (no wd on constrained matrices);
-    beta2 is AdamW-only."""
+    means beta1 for adamw and beta2 (the EMA decay) for lionmuon; manifold
+    skips wd (no wd on constrained matrices); the separate beta2 sweep is
+    AdamW-only; alpha is lionmuon-only."""
     if opt == "adamw":
         return ("lr", "wd", "momentum", "beta2", "clip")
+    if opt == "lionmuon":
+        return ("lr", "wd", "alpha", "momentum", "clip")
     if opt == "manifold":
         return ("lr", "momentum", "clip")
     return ("lr", "wd", "momentum", "clip")
@@ -402,7 +446,11 @@ def _grid_values(hp: str, opt: str, state: dict, sv: dict) -> list:
         d = float(sv["optimizers"][opt]["wd"])  # plain default (answer 3)
         return [f * d for f in WD_FACTORS]
     if hp == "momentum":
+        if opt == "lionmuon":
+            return list(LIONMUON_BETA2_GRID)
         return list(BETA1_GRID if opt == "adamw" else MOMENTUM_GRID)
+    if hp == "alpha":
+        return list(LIONMUON_ALPHA_GRID)
     if hp == "beta2":
         return list(BETA2_GRID)
     if hp == "clip":
@@ -410,18 +458,21 @@ def _grid_values(hp: str, opt: str, state: dict, sv: dict) -> list:
     raise ValueError(hp)
 
 
-_STATE_KEY = {"lr": "lr", "wd": "wd", "beta2": "beta2", "clip": "clip"}
+_STATE_KEY = {"lr": "lr", "wd": "wd", "beta2": "beta2", "clip": "clip",
+              "alpha": "alpha"}
 
 
 def _state_key(hp: str, opt: str) -> str:
     if hp == "momentum":
+        if opt == "lionmuon":
+            return "beta2"
         return "beta1" if opt == "adamw" else "momentum"
     return _STATE_KEY[hp]
 
 
 def _sweep_label(hp: str, opt: str) -> str:
     """The cd_sweep label: the hyper actually swept (beta1 for adamw's
-    momentum slot)."""
+    momentum slot, beta2 for lionmuon's)."""
     return _state_key(hp, opt) if hp == "momentum" else hp
 
 
@@ -522,7 +573,7 @@ def _has_cd(study: str) -> bool:
 
 def _adamw_group_for(study: str, opt: str, view: ResultsView,
                      config_dir=None, track: str = "auto") -> tuple[float, float] | None:
-    """(lr, wd) the muon/manifold auxiliary AdamW group must use — AdamW's
+    """(lr, wd) the muon/manifold/lionmuon auxiliary AdamW group must use — AdamW's
     tuned winner for this study ON THE SAME TRACK (Phase I: cd state; Phase
     II: Stage winner). ``track``: "cd", "phase2", or "auto" (= cd in
     Phase-I studies, phase2 otherwise). In FULL_RETUNE_STUDIES the CD track
@@ -530,7 +581,7 @@ def _adamw_group_for(study: str, opt: str, view: ResultsView,
     AdamW's Phase-II winner, so each track is internally consistent. None
     while AdamW's tuning on that track is incomplete. For other optimizers:
     None (and unused)."""
-    if opt not in ("muon", "manifold"):
+    if opt not in AUX_ADAMW_OPTIMIZERS:
         return None
     if track == "auto":
         track = "cd" if study in PHASE1_STUDIES else "phase2"
@@ -555,7 +606,7 @@ def cd_replay(study: str, opt: str, view: ResultsView,
 
     std = pilot_seed_std(study, view, config_dir)
     group = _adamw_group_for(study, opt, view, config_dir, track="cd")
-    if std is None or (opt in ("muon", "manifold") and group is None):
+    if std is None or (opt in AUX_ADAMW_OPTIMIZERS and group is None):
         return CDReplay(blocked=True, state=state, sweeps=sweeps, done=False)
 
     pass_changed = {1: False, 2: False}
@@ -616,10 +667,10 @@ def phase1_values(study: str, opt: str, view: ResultsView,
 
 def inherited_values(study: str, opt: str, view: ResultsView,
                      config_dir=None) -> dict | None:
-    """Non-lr/wd values (momentum, beta1, beta2, clip) copied from the donor
-    study's Phase-I result for this optimizer; lr and wd reset to this
-    study's literature defaults (they are what Phase II re-tunes). None while
-    the donor's Phase I is incomplete."""
+    """Non-lr/wd values (momentum, beta1, beta2, clip — and alpha, for
+    lionmuon) copied from the donor study's Phase-I result for this
+    optimizer; lr and wd reset to this study's literature defaults (they are
+    what Phase II re-tunes). None while the donor's Phase I is incomplete."""
     donor = PHASE2_DONOR[study]
     donor_vals = phase1_values(donor, opt, view, config_dir)
     if donor_vals is None:
@@ -628,6 +679,8 @@ def inherited_values(study: str, opt: str, view: ResultsView,
     vals = cd_defaults(sv, opt)
     for key in ("momentum", "beta1", "beta2", "clip"):
         vals[key] = donor_vals[key]
+    if opt == "lionmuon":
+        vals["alpha"] = donor_vals["alpha"]
     return vals
 
 
@@ -646,7 +699,7 @@ def _stage_cells(study: str, opt: str, view: ResultsView, config_dir=None):
     sv = load_study(study, config_dir)
     vals = inherited_values(study, opt, view, config_dir)
     group = _adamw_group_for(study, opt, view, config_dir, track="phase2")
-    if vals is None or (opt in ("muon", "manifold") and group is None):
+    if vals is None or (opt in AUX_ADAMW_OPTIMIZERS and group is None):
         return None
     centre = float(sv["optimizers"][opt]["lr"])
 
@@ -908,7 +961,7 @@ def _cd_phases(study: str, view: ResultsView, config_dir=None) -> list[Phase]:
     phases = []
     adamw_end = _cd_phase_names("adamw")[-1]
     for opt in _included(sv):
-        first_needs = ("pilot",) if opt not in ("muon", "manifold") \
+        first_needs = ("pilot",) if opt not in AUX_ADAMW_OPTIMIZERS \
             else ("pilot", adamw_end)
         prev = None
         for p, hp in _cd_spec(opt):
@@ -958,7 +1011,7 @@ def _build_dag_phase2(study: str, view: ResultsView, config_dir=None,
         return lambda: inherited_values(study, o, view, config_dir) is not None
 
     for opt in _included(sv):
-        needs_a = ("adamw_edge_b",) if opt in ("muon", "manifold") else ()
+        needs_a = ("adamw_edge_b",) if opt in AUX_ADAMW_OPTIMIZERS else ()
 
         def a_cfgs(o=opt):
             st = _stage_cells(study, o, view, config_dir)
@@ -1054,6 +1107,7 @@ def planned_jobs(study: str, config_dir=None) -> list[dict]:
     group = {"muon": (float(sv["optimizers"]["adamw"]["lr"]),
                       float(sv["optimizers"]["adamw"]["wd"]))}
     group["manifold"] = group["muon"]
+    group["lionmuon"] = group["muon"]
 
     for opt in _included(sv):
         g = group.get(opt)

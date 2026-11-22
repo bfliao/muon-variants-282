@@ -66,7 +66,7 @@ def per_step_flops(study: str, opt: str) -> float:
     nearest-study fallback."""
     sv = studies.load_study(study)
     group = None
-    if opt in ("muon", "manifold"):
+    if opt in studies.AUX_ADAMW_OPTIMIZERS:
         group = (float(sv["optimizers"]["adamw"]["lr"]),
                  float(sv["optimizers"]["adamw"]["wd"]))
     cfg = studies.run_config(sv, opt, "smoke", studies.cd_defaults(sv, opt),

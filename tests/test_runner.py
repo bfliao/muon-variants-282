@@ -45,13 +45,13 @@ def fake_train(monkeypatch):
 def test_run_study_completes_and_is_idempotent(tmp_path, fake_train):
     r = runner.Runner(tmp_path)
     n = r.run_study("mlp128")
-    assert n == len(fake_train) == 101   # the no-change/no-edge scenario
+    assert n == len(fake_train) == 121   # the no-change/no-edge scenario (101 + 20 lionmuon)
     # every phase complete, nothing pending
     for phase, ready, cfgs, pending, mine in r._survey("mlp128"):
         assert ready and not pending, phase.name
     # idempotent: a second call executes nothing
     assert r.run_study("mlp128") == 0
-    assert len(fake_train) == 101
+    assert len(fake_train) == 121
 
 
 def test_skip_if_done(tmp_path, fake_train):
@@ -127,7 +127,7 @@ def test_keyboard_interrupt_propagates_and_resumes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(train, "run", fake_run2)
     r.run_study("mlp128")
-    assert len(calls) == 101
+    assert len(calls) == 121
 
 
 # ---------------------------------------------------------------- sharding
@@ -154,7 +154,7 @@ def test_shard_partition_covers_and_is_disjoint(tmp_path, monkeypatch):
     h0 = {runner.config_hash(c) for c in by_shard[0]}
     h1 = {runner.config_hash(c) for c in by_shard[1]}
     assert h0 and h1 and h0.isdisjoint(h1)
-    assert len(h0 | h1) == 101                      # together: the full study
+    assert len(h0 | h1) == 121                      # together: the full study
     for i, cfgs in by_shard.items():
         for c in cfgs:
             assert int(runner._shard_key(c), 16) % 2 == i

@@ -33,5 +33,9 @@ optimizers:
   muon:      {lr: 0.02,   wd: 0.01, momentum: 0.95}
   moonlight: {lr: 1.0e-3, wd: 0.1,  momentum: 0.95}  # selling point: reuses AdamW's lr
   muonall:   {lr: 0.02,   wd: 0.01, momentum: 0.95}
+  # Lion-Muon (brain-lab-research/lion-muon @ e9077a8): lr/wd centre = Moonlight's
+  # (same update scale); alpha/betas = the reference's FineWeb P=5 winner.
+  # period and beta1 are FIXED; lr, wd, alpha, beta2, clip are tuned.
+  lionmuon:  {lr: 1.0e-3, wd: 0.1,  alpha: 30, beta1: 0.9, beta2: 0.99, period: 5}
   manifold:  {lr: 0.1,    wd: null, momentum: 0.95,  # TML default lr
               dual_cap: 5, tol: 1.0e-6, dual_lr: 0.01, msign_steps: 10}
