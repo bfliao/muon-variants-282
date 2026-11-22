@@ -1,10 +1,11 @@
 # Muon variants × architectures
 
-Course project for Berkeley CS 282. We compare five optimizers — AdamW, Muon, Moonlight-Muon,
-Manifold Muon and MuonAll — under one equal-tuning protocol, on MLPs of width 128/256/512
+Course project for Berkeley CS 282. We compare six optimizers — AdamW, Muon, Moonlight-Muon,
+Manifold Muon, MuonAll and Lion-Muon — under one equal-tuning protocol, on MLPs of width 128/256/512
 (CIFAR-5m) and on tiny Qwen3-style transformers, dense and MoE (FineWeb-Edu).
 
-**Status (2026-11-18):** the MLP and dense-transformer studies are complete (3 seeds). The MoE
+**Status (2026-11-21):** the MLP and dense-transformer studies are complete (3 seeds), including
+Lion-Muon, added as a sixth optimizer (DEVIATIONS #15). The MoE
 study has not run yet.
 
 ## Where things are
@@ -17,13 +18,14 @@ study has not run yet.
 | `docs/team_briefing.pdf` | Short briefing: what we do, why, and what changed from the proposal. |
 | `docs/manifold_audit.md` | Why Manifold Muon lags, and the checks that rule out a bug. |
 | `docs/figures_spec.md` | Specification of the report's figures. |
+| `paper/method.tex`, `paper/method.pdf` | Method section in NeurIPS format (two pages). Build: `cd paper && latexmk -pdf main.tex`. |
 | `figures/` | The generated figures (PNG and PDF). |
 | `tables/main.md`, `tables/hypotheses.csv` | Main results table and hypothesis verdicts. |
 | `results/<study>/*.json` | One file per run: config, final losses, FLOPs. |
 | `logs/<study>/*.jsonl` | One file per run: the training curve and diagnostics. |
 | `muonarch/` | Code: optimizers, models, training loop, study definitions, analysis, figures. |
 | `configs/` | One YAML per study. |
-| `third_party/manifolds/` | Thinking Machines' Manifold Muon reference code, vendored unmodified. |
+| `third_party/manifolds/`, `third_party/lion_muon/` | Reference code for Manifold Muon and Lion-Muon, vendored unmodified (test oracles). |
 
 ## Setup
 

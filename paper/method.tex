@@ -1,0 +1,137 @@
+% Method section. Every number here is taken from PLAN.md, DEVIATIONS.md,
+% configs/ or results/; change those first, then this text.
+\section{Method}
+\label{sec:method}
+
+Our goal is a comparison in which a difference between two optimizers can be attributed only to
+the optimizers. We fix (i) one implementation that isolates each method's stated idea, (ii) one
+tuning procedure for every method, (iii) metrics read only at the end of training, and (iv) a
+rule for calling a difference real. The protocol and seven hypotheses, each with its falsifying
+result, were written before the first sweep; every departure since is logged under version
+control (15 entries), and those that affect interpretation are stated below.
+
+\subsection{Studies, models and data}
+
+We run two studies and never compare rankings across them, because task, data and model family
+change together. \textbf{Study A (width).} A ReLU MLP $3072\!\to\!w\!\to\!w\!\to\!w\!\to\!10$ with
+biases, $w\in\{128,256,512\}$, trained on CIFAR-5m \citep{nakkiran2021bootstrap} in a single
+pass: 3{,}520 steps at batch 256, no augmentation, no image seen twice, so there is no
+overfitting and validation loss measures optimization speed, as in the language model.
+Validation and test sets (10k images each) are fixed and never trained on. \textbf{Study B (transformer).} A 6-layer Qwen3-style decoder
+\citep{yang2025qwen3} with $d_{\text{model}}=128$, grouped-query attention, QK-norm, SwiGLU of
+width 384 and tied embeddings (1{,}706{,}368 parameters), trained on FineWeb-Edu
+\citep{penedo2024fineweb} with a 4{,}096-token byte-level BPE fitted on training documents
+only: 2{,}441 steps of $32\times256$ tokens (20M tokens), evaluated on a fixed 2M-token
+validation set. A Mixture-of-Experts arm is specified under the same protocol but has not been
+run; no result here depends on it.
+
+\textbf{Shared training settings.} Every run has a fixed step budget, identical across
+optimizers; the only early stop is divergence (NaN, or loss above its initial value). The
+learning-rate schedule is linear warmup over 5\% of the budget, constant, then linear decay to
+zero over the last 20\%. Seed $s$ fixes both the initialisation and the data order identically
+for every optimizer, so all comparisons are paired. All 745 training runs used one machine and
+fp32 throughout, including every matrix iteration, so precision is not a hidden variable. Each
+run is keyed by a hash of its configuration and records its commit; all tables and figures are
+regenerated from these files, and the code has 572 tests.
+
+\subsection{Optimizers under one implementation}
+
+Official implementations differ in ways unrelated to their methods (iteration counts,
+precision, momentum form). We remove these differences. Muon, Moonlight, MuonAll and Lion-Muon
+call one Newton--Schulz routine (5 iterations, fp32), so
+they differ only as Table~\ref{tab:optimizers} states. Manifold Muon keeps the exact matrix sign
+its algorithm requires (10 Polar Express iterations \citep{amsel2025polar}, for dual ascent and
+retraction), because the fast coefficients leave singular values in roughly $[0.7,1.1]$ and
+would take the weights off the manifold. Its reference code uses no momentum; we feed it the
+same Nesterov buffer as Muon so the comparison isolates the constraint. Its dual ascent is capped
+at 5 steps, and the cap is part of the method we report. Where a method
+keeps an AdamW group (embeddings, classifier, norms, biases), it uses the tuned AdamW
+baseline's learning rate and weight decay, so an untuned group cannot sink a variant.
+
+\textbf{Checks on the standardisation.} (a) Optimizers are tested step-for-step against an
+independent oracle: \texttt{torch.optim.Muon} for Muon and Moonlight, the unmodified vendored
+reference code for Manifold Muon and Lion-Muon. (b) Before modifying the Manifold Muon code we
+reproduced its published CIFAR-10 result with the unmodified script (test accuracy
+$51.7\pm0.5$ versus $48.7\pm0.3$ for AdamW, 3 seeds). (c) Each variant's selected configuration
+is rerun with its official settings (bf16 Newton--Schulz; 6 bf16 iterations for MuonAll; 100
+dual steps for Manifold Muon). (d) Manifold Muon projects weights onto the manifold at
+initialisation, so we also run Muon from that initialisation (3 seeds) to separate the two.
+
+\begin{table}[t]
+\caption{The six optimizers: AdamW \citep{loshchilov2019adamw}, Muon \citep{jordan2024muon},
+Moonlight \citep{liu2025moonlight}, MuonAll \citep{page2025muonall}, Manifold Muon
+\citep{bernstein2025manifolds} and Lion-Muon \citep{lionmuon2026}. ``Matrices'' are all hidden
+weight matrices, including the MLP input layer (without it, the share of parameters Muon
+updates would vary from 8\% to 25\% with width). NS$_5$: five Newton--Schulz
+iterations; $m,n$: fan-out, fan-in; $\mu$: momentum.}
+\label{tab:optimizers}
+\centering\small
+\begin{tabular}{@{}l>{\raggedright\arraybackslash}p{5.5cm}>{\raggedright\arraybackslash}p{2.7cm}l@{}}
+\toprule
+Optimizer & Update on matrices & Other parameters & Tuned \\
+\midrule
+AdamW & --- & AdamW & lr, wd, $\beta_1$, $\beta_2$, clip \\
+Muon & NS$_5$(Nesterov momentum) $\times\sqrt{\max(1,m/n)}$ & AdamW (baseline's) & lr, wd, $\mu$, clip \\
+Moonlight & as Muon, $\times\,0.2\sqrt{\max(m,n)}$ & AdamW (shared) & lr, wd, $\mu$, clip \\
+MuonAll & as Muon; 1-D parameters and embeddings also orthogonalised & none & lr, wd, $\mu$, clip \\
+Manifold Muon & Stiefel-constrained step: $\le 5$ dual-ascent steps, retraction by matrix sign & AdamW (baseline's) & lr, $\mu$, clip \\
+Lion-Muon & Muon step every $P{=}5$ steps, sign step of size lr$/\alpha$ otherwise & AdamW (baseline's) & lr, wd, $\alpha$, $\beta_2$, clip \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Equal tuning}
+
+Following \citet{wen2025fantastic}, every optimizer is tuned by coordinate descent on seed 0,
+starting from its literature defaults. Hyperparameters are swept one at a time in a fixed
+order, the others held at their current best: learning rate (six points, factor-2 spacing,
+spanning $32\times$), weight decay ($\{0, 0.3, 1, 3\}\times$ default), momentum
+($\{0.9, 0.95, 0.98\}$; AdamW $\beta_1\in\{0.8,0.9,0.95\}$), AdamW
+$\beta_2\in\{0.95,0.99,0.999\}$, and gradient clipping $\{\text{off}, 0.5, 1.0\}$. Lion-Muon
+additionally sweeps $\alpha\in\{3,10,30,100,300\}$ and uses $\beta_2\in\{0.9,0.95,0.99\}$ as its
+momentum sweep. A new value is accepted only if it improves final validation loss by more than
+$2\hat\sigma$, where $\hat\sigma$ is that study's seed standard deviation, measured by a
+3-seed AdamW pilot on separate seeds ($0.0053$, $0.0019$, $0.0016$ for $w=128,256,512$; $0.0291$
+for the transformer), so the search cannot fit seed noise. At most two passes are made. If the best learning rate lies on a grid edge, up to two further
+trials are added beyond it, for every optimizer, and reported. The descent is run independently
+at every MLP width; this replaced the original plan of inheriting settings from $w=128$, a
+change made during the sweeps, and the inherited-settings runs are kept for comparison. Warmup is fixed, not tuned (a departure from their protocol).
+
+\textbf{Selection bias.} The selected configuration is the best of many trials on seed 0, so its
+seed-0 loss is biased low. We rerun it on fresh seeds 1--3 and report those three runs only.
+
+\textbf{Lion-Muon} was added after all other runs had finished, through the identical procedure.
+It has one more tuned hyperparameter than Muon, fixed $P$ and $\beta_1=0.9$, and is outside the pre-specified hypotheses.
+
+\subsection{Metrics and decision rule}
+
+\textbf{Final validation loss} is the headline metric (mean $\pm$ standard deviation, seeds
+1--3). \textbf{Token speedup} follows \citet{wen2025fantastic}. A checkpoint taken before
+learning-rate decay understates what a run of that length achieves, so we never read speedups
+off intermediate checkpoints. Instead, for each seed we train tuned
+AdamW at data budgets $D\in\{\tfrac18,\tfrac14,\tfrac12,1,2\}\times$ the base budget, each with
+its own complete decay, and fit
+\begin{equation}
+\hat L_{\text{AdamW}}(D)=aD^{-b}+c,\qquad
+\text{speedup}_{\text{tok}}=\hat L_{\text{AdamW}}^{-1}\!\left(L_{\text{opt}}\right)/D_{\text{base}} .
+\end{equation}
+A $2\times$ run at half the learning rate (seed 1) guards against the reused learning rate
+handicapping AdamW at long budgets, which would inflate every speedup; the lower $2\times$ loss
+is used. We report the range over all $3\times3$ pairs of fitted curve and optimizer seed, and flag extrapolated values.
+
+\textbf{FLOP speedup} is the same ratio in total training FLOPs, including the optimizer:
+\begin{equation}
+F = F_{\text{model}} + \sum_{t=1}^{S}\ \sum_{W\in\mathcal M_t} k_t(W)\,\bigl(4p^2q+2p^3\bigr),
+\qquad p=\min(m,n),\ q=\max(m,n),
+\end{equation}
+where $\mathcal M_t$ is the set of matrices orthogonalised at step $t$ and $k_t(W)$ the matrix
+iterations actually executed: Manifold Muon is charged the sign calls it made, Lion-Muon only
+its Muon steps. The count is analytic, checked against PyTorch's FLOP counter. We never report
+wall-clock time.
+
+\textbf{Decision rule.} A difference between two optimizers is called real only if all three
+paired seed differences share a sign and the mean difference exceeds twice the larger seed
+standard deviation; otherwise the pair is reported as indistinguishable, with the seed spread.
+With three seeds this is a heuristic, not a significance test, and we label it as such.
+
+

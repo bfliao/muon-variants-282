@@ -1,0 +1,18 @@
+% Wrapper that compiles the Method section on its own, in NeurIPS format.
+% Build: cd paper && latexmk -pdf main.tex
+\documentclass{article}
+\usepackage[preprint]{neurips_2025}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath,amsfonts}
+\usepackage{microtype}
+\setcounter{section}{2}
+\begin{document}
+\input{method}
+\bibliographystyle{plainnat}
+\bibliography{references}
+\end{document}
